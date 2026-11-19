@@ -4,3 +4,7 @@ __pycache__/
 reminders.json
 settings.json
 error.log
+build/
+dist/
+*.spec
+icon.ico

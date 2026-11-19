@@ -1,0 +1,3 @@
+# Optional: enables the system-tray icon. The app still runs without these.
+pystray>=0.19
+pillow>=9.1
