@@ -7,6 +7,7 @@ For the system-tray icon:  pip install pystray pillow
 """
 
 import calendar
+import copy
 import ctypes
 import json
 import os
@@ -18,9 +19,11 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.request
 import uuid
+import webbrowser
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -47,6 +50,8 @@ LOCK_PORT = 47613
 NO_WINDOW = 0x08000000
 HOTKEY_LABEL = "Ctrl+Alt+R"
 NTFY_SERVER = "https://ntfy.sh"
+VERSION = "2.1.0"
+NAG_SECONDS = 300   # ignored pop-ups shake and jump to the front again this often
 
 # ---------------------------------------------------------------- themes
 
@@ -91,16 +96,23 @@ DEFAULT_THEME = "Vintage Almanac"
 C = dict(THEMES[DEFAULT_THEME])   # current theme; replaced in place when the theme changes
 
 
+UI = {"scale": 1.0}   # text-size multiplier, set from the Size menu
+
+
+def _sz(size):
+    return max(6, round(size * UI["scale"]))
+
+
 def f(size, *style):
-    return (C["F"], size, *style)
+    return (C["F"], _sz(size), *style)
 
 
 def fh(size, *style):
-    return (C["FH"], size, "bold", *style)
+    return (C["FH"], _sz(size), "bold", *style)
 
 
 def fm(size, *style):
-    return (C["FM"], size, *style)
+    return (C["FM"], _sz(size), *style)
 
 
 def heading(text, spaced=True):
@@ -119,11 +131,12 @@ def cat_color(r):
     return CAT_COLOR.get(r.get("category") or "Personal", CAT_COLOR["Personal"])
 
 
-DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 1.0,
+DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 0.85, "solid_on_hover": True,
                     "collapsed": False, "hidden": False, "allday_time": "09:00",
                     "week_start": 0, "theme": DEFAULT_THEME, "hold_fullscreen": True,
                     "auto_update": True, "phone_topic": "", "big_geom": None,
-                    "tray_hint_shown": False,
+                    "tray_hint_shown": False, "size": 1.0, "sound": True, "nag": True,
+                    "data_dir": None,
                     # automatic light/dark: "off", "schedule" (by time) or "windows" (follow Windows)
                     "auto_theme": "schedule", "light_theme": DEFAULT_THEME,
                     "dark_theme": "Midnight Noir", "light_start": "07:00", "dark_start": "19:00"}
@@ -282,6 +295,26 @@ def fmt_date(d):
 def format_when(r):
     d = date.fromisoformat(r["date"])
     return fmt_date(d) + (f" at {fmt_time(r['time'])}" if r.get("time") else " (all day)")
+
+
+def normalize_link(s):
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if not re.match(r"(?i)^(https?://|mailto:)", s):
+        s = "https://" + s
+    return s
+
+
+def open_link(url):
+    if url and re.match(r"(?i)^(https?://|mailto:)", url):
+        webbrowser.open(url)
+
+
+def progress(r):
+    """'2/3' for a reminder with a checklist, '' otherwise."""
+    items = r.get("checklist") or []
+    return f"{sum(1 for i in items if i.get('done'))}/{len(items)}" if items else ""
 
 
 def rel_days(n):
@@ -477,7 +510,8 @@ def parse_quick(text, now=None):
     now = now or datetime.now()
     today = now.date()
     st = {"s": f" {text.strip()} "}
-    res = {"date": None, "time": "", "repeat": "none", "advance": 0, "category": "Personal"}
+    res = {"date": None, "time": "", "repeat": "none", "advance": 0, "category": "Personal",
+           "link": "", "important": False}
 
     def take(pattern, fn):
         m = re.search(pattern, st["s"], re.I)
@@ -501,6 +535,14 @@ def parse_quick(text, now=None):
             res["date"] = date(y, mo, d)
         except ValueError:
             return False
+
+    # a link: https://... or www....
+    take(r"(?<!\S)((?:https?://|www\.)\S+)",
+         lambda m: res.update(link=normalize_link(m[1].rstrip(".,;)"))))
+
+    # important: "!", "important", "urgent", "#important"
+    take(r"#(?:important|urgent)\b|\b(?:important|urgent)\b|(?<!\S)!+(?!\S)",
+         lambda m: res.update(important=True))
 
     # category: #work, #bills ...
     def f_cat(m):
@@ -600,10 +642,17 @@ def parse_quick(text, now=None):
          or take(r"\btoday\b", lambda m: res.update(date=today))
          or take(r"\btonight\b", lambda m: res.update(date=today, time=res["time"] or "20:00")))
 
-    # weekday: "on friday", "next monday"
+    # weekday: "friday", "on fri", "next monday" (= the one in next week). Bare short forms
+    # like "sat" are ignored so "SAT exam" isn't read as Saturday.
+    def f_wd(m):
+        w = _wd(m[2])
+        if m[1] and m[1].lower().startswith("next"):
+            res["date"] = today + timedelta(days=7 - today.weekday() + w)
+        else:
+            res["date"] = next_wd(w)
     if res["date"] is None:
-        take(r"\b(?:on\s+)?(next\s+|this\s+)?" + WD_RE + r"\b",
-             lambda m: res.update(date=next_wd(_wd(m[2]), bool(m[1]) and m[1].lower().startswith("next"))))
+        (take(r"\b(?:on\s+)?(next\s+|this\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", f_wd)
+         or take(r"\b(on\s+|next\s+|this\s+)" + WD_RE + r"\b", f_wd))
 
     # day of month: "on the 5th", "1st"
     if res["date"] is None:
@@ -688,8 +737,14 @@ def export_ics(reminders, path):
         else:
             L += [f"DTSTART;VALUE=DATE:{d:%Y%m%d}", f"DTEND;VALUE=DATE:{d + timedelta(days=1):%Y%m%d}"]
         L.append("SUMMARY:" + ics_escape(r["title"]))
-        if r.get("notes"):
-            L.append("DESCRIPTION:" + ics_escape(r["notes"]))
+        desc = r.get("notes", "")
+        if r.get("checklist"):
+            desc += ("\n" if desc else "") + "\n".join(
+                ("☑ " if i.get("done") else "☐ ") + i["text"] for i in r["checklist"])
+        if desc:
+            L.append("DESCRIPTION:" + ics_escape(desc))
+        if r.get("link"):
+            L.append("URL:" + r["link"])
         if r.get("category"):
             L.append("CATEGORIES:" + ics_escape(r["category"]))
         if r.get("repeat", "none") in RRULE:
@@ -769,6 +824,7 @@ def read_ics(path):
                "advance": min(ev.get("_adv", 0), 30),
                "notes": ics_unescape(ev.get("DESCRIPTION", ([], ""))[1])[:2000],
                "category": "Personal",
+               "link": normalize_link(ev.get("URL", ([], ""))[1]) if ev.get("URL", ([], ""))[1].lower().startswith("http") else "",
                "ics_uid": ev.get("UID", ([], ""))[1]}
         cats = ics_unescape(ev.get("CATEGORIES", ([], ""))[1]).split(",")[0].strip().lower()
         rec["category"] = next((c for c, _ in CATEGORIES if c.lower() == cats), "Personal")
@@ -826,10 +882,58 @@ def hotkey_loop(q):
 class Store:
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
-        self.reminders = self._load(REM_FILE, [])
         self.settings = {**DEFAULT_SETTINGS, **self._load(SET_FILE, {})}
         if self.settings.get("theme") not in THEMES:
             self.settings["theme"] = DEFAULT_THEME
+        self.reminders = self._load(self.rem_file, [])
+        self.mtime = self._mtime()
+
+    @property
+    def data_dir(self):
+        """Where reminders.json lives: the chosen (e.g. OneDrive) folder, else the local one."""
+        d = self.settings.get("data_dir")
+        return d if d and os.path.isdir(d) else DATA_DIR
+
+    @property
+    def rem_file(self):
+        return os.path.join(self.data_dir, "reminders.json")
+
+    def _mtime(self):
+        try:
+            return os.path.getmtime(self.rem_file)
+        except OSError:
+            return None
+
+    def changed_on_disk(self):
+        return self._mtime() != self.mtime
+
+    def reload(self):
+        """Re-read reminders saved by another PC through a synced folder. Skips half-synced files."""
+        try:
+            with open(self.rem_file, encoding="utf-8") as fh_:
+                data = json.load(fh_)
+        except (OSError, ValueError):
+            return False
+        self.mtime = self._mtime()
+        if not isinstance(data, list):
+            return False
+        self.reminders = data
+        return True
+
+    def _backup(self):
+        """Keep one copy per day in <data folder>\\backups (last 14 days)."""
+        try:
+            bdir = os.path.join(self.data_dir, "backups")
+            path = os.path.join(bdir, f"reminders-{date.today():%Y-%m-%d}.json")
+            if os.path.exists(path):
+                return
+            os.makedirs(bdir, exist_ok=True)
+            self._write(path, self.reminders)
+            old = sorted(n for n in os.listdir(bdir) if n.startswith("reminders-") and n.endswith(".json"))
+            for n in old[:-14]:
+                os.remove(os.path.join(bdir, n))
+        except OSError:
+            log_error(traceback.format_exc())
 
     @staticmethod
     def _load(path, default):
@@ -853,7 +957,10 @@ class Store:
         os.replace(tmp, path)
 
     def save(self):
-        self._write(REM_FILE, self.reminders)
+        os.makedirs(self.data_dir, exist_ok=True)
+        self._write(self.rem_file, self.reminders)
+        self.mtime = self._mtime()
+        self._backup()
 
     def save_settings(self):
         self._write(SET_FILE, self.settings)
@@ -941,7 +1048,7 @@ class Tip:
 class Card(tk.Toplevel):
     """Base for the stacked pop-ups in the bottom-right corner."""
 
-    def __init__(self, app, key, stripe):
+    def __init__(self, app, key, stripe, thick=False):
         super().__init__(app.root)
         self.app, self.key = app, key
         s = app.s
@@ -950,7 +1057,8 @@ class Card(tk.Toplevel):
         self.configure(bg=C["border"])
         self.stripe = stripe
         self.outer = outer = tk.Frame(self, bg=stripe)
-        outer.pack(fill="both", expand=True, padx=1, pady=1)
+        pad = max(1, int((4 if thick else 1) * s))   # important cards get a thick blinking frame
+        outer.pack(fill="both", expand=True, padx=pad, pady=pad)
         self.body = tk.Frame(outer, bg=C["panel"], padx=int(14 * s), pady=int(12 * s))
         self.body.pack(fill="both", expand=True, padx=(int(6 * s), 0))
         self.wrap = int(300 * s)
@@ -960,11 +1068,15 @@ class Card(tk.Toplevel):
                  wraplength=self.wrap, justify="left", anchor="w").pack(fill="x", pady=pady)
 
     def show(self):
+        old = self.app.toasts.get(self.key)
+        if old is not None and old is not self:
+            old.close()
         self.app.toasts[self.key] = self
         self.app.restack_toasts()
 
     def close(self):
-        self.app.toasts.pop(self.key, None)
+        if self.app.toasts.get(self.key) is self:
+            self.app.toasts.pop(self.key, None)
         try:
             self.destroy()
         except tk.TclError:
@@ -977,8 +1089,12 @@ class Toast(Card):
         heads = {"due": ("REMINDER", C["accent"]), "snooze": ("REMINDER \u00b7 SNOOZED", C["accent"]),
                  "missed": ("MISSED REMINDER", C["danger"]), "advance": ("COMING UP", C["ok"])}
         head, color = heads[kind]
-        super().__init__(app, r["id"], cat_color(r))
-        self.rid, self.kind = r["id"], kind
+        important = bool(r.get("important"))
+        if important:
+            head, color = "IMPORTANT \u00b7 " + head, C["danger"]
+        super().__init__(app, r["id"], cat_color(r), thick=important)
+        self.rid, self.kind, self.important = r["id"], kind, important
+        self.last_nag = time.monotonic()
         self.label(f"\u23f0  {heading(head, spaced=False)}", fh(8), color)
         self.label(r["title"], fh(13), pady=(3, 0))
         if kind == "advance":
@@ -991,6 +1107,17 @@ class Toast(Card):
         self.label(when, f(9), C["dim"], pady=(2, 0))
         if r.get("notes"):
             self.label(r["notes"], f(9), pady=(8, 0))
+        self.check_frame = None
+        if r.get("checklist"):
+            self.check_frame = tk.Frame(self.body, bg=C["panel"])
+            self.check_frame.pack(fill="x", pady=(8, 0))
+            self._draw_checklist()
+        if r.get("link"):
+            lrow = tk.Frame(self.body, bg=C["panel"])
+            lrow.pack(fill="x", pady=(8, 0))
+            link = r["link"]
+            mkbtn(lrow, "Open link ↗", lambda: open_link(link), bg=C["bg"],
+                  fg=C["accent"], font=f(9, "bold")).pack(side="left")
 
         row = tk.Frame(self.body, bg=C["panel"])
         row.pack(fill="x", pady=(12, 0))
@@ -1006,12 +1133,37 @@ class Toast(Card):
                 mkbtn(row, label, lambda d=delta: self.snooze(d), bg=C["bg"],
                       font=f(8), padx=7, pady=3).pack(side="left", padx=(0, 4))
         self.show()
-        play_sound()
+        if app.store.settings.get("sound", True):
+            play_sound()
+
+    def _draw_checklist(self):
+        for w in self.check_frame.winfo_children():
+            w.destroy()
+        r = self.app.store.get(self.rid)
+        if not r:
+            return
+        for i, item in enumerate(r.get("checklist") or []):
+            done = item.get("done")
+            lb = tk.Label(self.check_frame, text=("☑  " if done else "☐  ") + item["text"],
+                          bg=C["panel"], fg=C["faint"] if done else C["fg"],
+                          font=f(9, "overstrike") if done else f(9), anchor="w", cursor="hand2",
+                          wraplength=self.wrap, justify="left")
+            lb.pack(fill="x")
+            lb.bind("<Button-1>", lambda e, i=i: self._toggle(i))
+
+    def _toggle(self, i):
+        r = self.app.store.get(self.rid)
+        if not r or i >= len(r.get("checklist") or []):
+            return
+        r["checklist"][i]["done"] = not r["checklist"][i].get("done")
+        self.app.store.save()
+        self._draw_checklist()
+        self.app.restack_toasts()
+        self.app.changed()
 
     def done(self):
-        self.app.store.complete(self.rid)
         self.close()
-        self.app.changed()
+        self.app.complete_with_undo(self.rid)
 
     def snooze(self, delta):
         if delta is None:
@@ -1031,7 +1183,7 @@ class Toast(Card):
 
 
 class Notice(Card):
-    def __init__(self, app, key, head, text, actions):
+    def __init__(self, app, key, head, text, actions, timeout=None):
         super().__init__(app, key, C["accent"])
         self.label(heading(head, spaced=False), fh(8), C["accent"])
         self.label(text, f(10), pady=(4, 0))
@@ -1043,6 +1195,8 @@ class Notice(Card):
                   bg=C["accent"] if primary else C["bg"],
                   fg=C["accent_fg"] if primary else C["fg"]).pack(side="right", padx=(6, 0))
         self.show()
+        if timeout:
+            self.after(timeout, self.close)
 
 
 # ---------------------------------------------------------------- dialogs
@@ -1103,22 +1257,47 @@ class ReminderDialog(tk.Toplevel):
         lab("Remind me early", 9)
         ttk.Combobox(self, textvariable=self.v_adv, values=adv_opts,
                      state="readonly", width=17).grid(row=10, column=0, sticky="we")
+        self.v_imp = tk.BooleanVar(value=bool(src.get("important")))
+        tk.Checkbutton(self, text="Important (blinks harder)", variable=self.v_imp,
+                       bg=C["bg"], fg=C["fg"], selectcolor=C["panel"], activebackground=C["bg"],
+                       activeforeground=C["fg"], font=f(9)).grid(row=10, column=1, sticky="w", padx=(12, 0))
 
-        lab("Notes (optional)", 11, columnspan=2)
-        self.t_notes = tk.Text(self, height=3, width=42, bg=C["panel"], fg=C["fg"],
+        lab("Link (optional): application page, form, meeting…", 11, columnspan=2)
+        lrow = tk.Frame(self, bg=C["bg"])
+        lrow.grid(row=12, column=0, columnspan=2, sticky="we")
+        self.v_link = tk.StringVar(value=src.get("link", ""))
+        entry(lrow, self.v_link, 34).pack(side="left", fill="x", expand=True, ipady=4)
+        mkbtn(lrow, "Open ↗", lambda: open_link(normalize_link(self.v_link.get())),
+              bg=C["panel"], font=f(9)).pack(side="left", padx=(6, 0))
+
+        lab("Checklist (optional): documents to prepare, steps…", 13, columnspan=2)
+        self.items = copy.deepcopy(src.get("checklist") or [])
+        self.ck = tk.Frame(self, bg=C["bg"])
+        self.ck.grid(row=14, column=0, columnspan=2, sticky="we")
+        addrow = tk.Frame(self, bg=C["bg"])
+        addrow.grid(row=15, column=0, columnspan=2, sticky="we", pady=(3, 0))
+        self.v_item = tk.StringVar()
+        self.e_item = entry(addrow, self.v_item, 34)
+        self.e_item.pack(side="left", fill="x", expand=True, ipady=3)
+        mkbtn(addrow, "+ Add item", self._add_item, bg=C["panel"], font=f(9)).pack(side="left", padx=(6, 0))
+        self.e_item.bind("<Return>", lambda e: (self._add_item(), "break")[1])
+        self._draw_items()
+
+        lab("Notes (optional)", 16, columnspan=2)
+        self.t_notes = tk.Text(self, height=2, width=42, bg=C["panel"], fg=C["fg"],
                                insertbackground=C["fg"], relief="flat", font=f(10),
                                highlightthickness=1, highlightcolor=C["accent"],
                                highlightbackground=C["border"], wrap="word")
-        self.t_notes.grid(row=12, column=0, columnspan=2, sticky="we")
+        self.t_notes.grid(row=17, column=0, columnspan=2, sticky="we")
         if src.get("notes"):
             self.t_notes.insert("1.0", src["notes"])
 
         self.err = tk.Label(self, text="", bg=C["bg"], fg=C["danger"], font=f(9),
                             anchor="w", wraplength=380, justify="left")
-        self.err.grid(row=13, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.err.grid(row=18, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         btns = tk.Frame(self, bg=C["bg"])
-        btns.grid(row=14, column=0, columnspan=2, sticky="we", pady=(8, 0))
+        btns.grid(row=19, column=0, columnspan=2, sticky="we", pady=(8, 0))
         mkbtn(btns, "Save", self.save, bg=C["accent"], fg=C["accent_fg"],
               font=f(9, "bold"), padx=16).pack(side="right")
         mkbtn(btns, "Cancel", self.destroy, bg=C["panel"]).pack(side="right", padx=(0, 6))
@@ -1140,6 +1319,38 @@ class ReminderDialog(tk.Toplevel):
         d = date.today() + timedelta(days=n)
         self.v_date.set(f"{d.day} {d:%b %Y}")
 
+    def _draw_items(self):
+        for w in self.ck.winfo_children():
+            w.destroy()
+        for i, it in enumerate(self.items):
+            done = it.get("done")
+            row = tk.Frame(self.ck, bg=C["panel"], padx=6, pady=1)
+            row.pack(fill="x", pady=1)
+            box = tk.Label(row, text="☑" if done else "☐", bg=C["panel"],
+                           fg=C["ok"] if done else C["fg"], font=f(11), cursor="hand2")
+            box.pack(side="left")
+            box.bind("<Button-1>", lambda e, i=i: self._toggle_item(i))
+            tk.Label(row, text=it["text"], bg=C["panel"], fg=C["faint"] if done else C["fg"],
+                     font=f(9, "overstrike") if done else f(9), anchor="w").pack(
+                side="left", fill="x", expand=True, padx=6)
+            mkbtn(row, "×", lambda i=i: self._remove_item(i), bg=C["panel"], fg=C["dim"],
+                  padx=4, pady=0).pack(side="right")
+
+    def _add_item(self):
+        t = self.v_item.get().strip()
+        if t:
+            self.items.append({"text": t, "done": False})
+            self.v_item.set("")
+            self._draw_items()
+
+    def _toggle_item(self, i):
+        self.items[i]["done"] = not self.items[i].get("done")
+        self._draw_items()
+
+    def _remove_item(self, i):
+        del self.items[i]
+        self._draw_items()
+
     def save(self):
         title = self.v_title.get().strip()
         if not title:
@@ -1152,32 +1363,37 @@ class ReminderDialog(tk.Toplevel):
             t = parse_time(self.v_time.get())
         except ValueError:
             return self.err.config(text="Couldn't read the time. Try 17:30 or 5:30 pm, or leave it empty.")
+        self._add_item()   # an item typed but not yet added still counts
         self.app.save_reminder(self.r, {
             "title": title, "date": d.isoformat(), "time": t,
             "advance": adv_from_label(self.v_adv.get()),
             "repeat": {lbl: k for k, lbl in REPEATS}[self.v_rep.get()],
             "category": self.v_cat.get(),
             "notes": self.t_notes.get("1.0", "end").strip(),
+            "link": normalize_link(self.v_link.get()),
+            "important": self.v_imp.get(),
+            "checklist": self.items,
         })
         self.destroy()
 
     def delete(self):
-        if messagebox.askyesno("Delete reminder", f"Delete \"{self.r['title']}\"?", parent=self):
-            self.app.close_toast(self.r["id"])
-            self.app.store.delete(self.r["id"])
-            self.app.changed()
-            self.destroy()
+        rid, title = self.r["id"], self.r["title"]
+        self.app.close_toast(rid)
+        self.destroy()
+        self.app.with_undo("Deleted", f"“{title}” was deleted.",
+                           lambda: self.app.store.delete(rid))
 
     def mark_done(self):
         self.app.close_toast(self.r["id"])
-        self.app.store.complete(self.r["id"])
-        self.app.changed()
+        rid = self.r["id"]
         self.destroy()
+        self.app.complete_with_undo(rid)
 
 
 class QuickAdd(tk.Toplevel):
-    EXAMPLES = ("apply for scholarship dec 1 5pm #college   \u00b7   pay rent 1st every month #bills\n"
-                "call mom tomorrow 7pm   \u00b7   exam in 3 days remind 1 day before   \u00b7   gym every monday 6am")
+    EXAMPLES = ("apply for scholarship dec 1 5pm #college !   \u00b7   pay rent 1st every month #bills\n"
+                "call mom tomorrow 7pm   \u00b7   exam in 3 days remind 1 day before   \u00b7   gym every monday 6am\n"
+                "fill visa form next friday www.example.com/form   (! = important, a link becomes a button)")
 
     def __init__(self, app):
         super().__init__(app.root)
@@ -1236,6 +1452,10 @@ class QuickAdd(tk.Toplevel):
         if p["advance"]:
             parts.append("early alert " + adv_label(p["advance"]))
         parts.append(p["category"])
+        if p["important"]:
+            parts.append("! important")
+        if p["link"]:
+            parts.append("↗ link")
         self.preview.config(text="\u2192 " + "   \u00b7   ".join(parts), fg=C["fg"])
 
     def add(self):
@@ -1243,7 +1463,8 @@ class QuickAdd(tk.Toplevel):
             p = parse_quick(self.v.get())
         except ValueError as e:
             return self.preview.config(text=str(e), fg=C["warn"])
-        data = {k: p[k] for k in ("title", "date", "time", "advance", "repeat", "category")}
+        data = {k: p[k] for k in ("title", "date", "time", "advance", "repeat", "category",
+                                  "link", "important")}
         data["notes"] = ""
         self.app.save_reminder(None, data)
         self.destroy()
@@ -1357,6 +1578,71 @@ class PhoneDialog(tk.Toplevel):
         self.app.store.settings["phone_topic"] = ""
         self.app.store.save_settings()
         self.destroy()
+
+
+def onedrive_folder():
+    od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+    return os.path.join(od, "MiniFloatingCalendar") if od and os.path.isdir(od) else None
+
+
+class DataDialog(tk.Toplevel):
+    """Choose where reminders are saved (e.g. OneDrive for backup / sharing between PCs)."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Data & sync")
+        self.configure(bg=C["bg"], padx=18, pady=16)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        tk.Label(self, text=heading("Data & sync", spaced=False), bg=C["bg"], fg=C["accent"],
+                 font=fh(11)).pack(anchor="w")
+        tk.Label(self, text="Your reminders are saved in:", bg=C["bg"], fg=C["dim"], font=f(9),
+                 anchor="w").pack(fill="x", pady=(10, 2))
+        self.path = tk.Label(self, text=app.store.data_dir, bg=C["panel"], fg=C["fg"], font=fm(9),
+                             anchor="w", justify="left", wraplength=int(440 * app.s), padx=8, pady=6)
+        self.path.pack(fill="x")
+        tk.Label(self, text=("Put them in OneDrive (or a Google Drive / Dropbox folder) to keep a copy in the "
+                             "cloud and to see the same reminders on another PC: install the calendar there "
+                             "and pick the same folder.\n\nA backup copy is also saved every day in the "
+                             "“backups” folder (the last 14 days are kept)."),
+                 bg=C["bg"], fg=C["fg"], font=f(9), justify="left", anchor="w",
+                 wraplength=int(440 * app.s)).pack(fill="x", pady=(10, 0))
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x", pady=(12, 0))
+        od = onedrive_folder()
+        if od:
+            mkbtn(row, "Use OneDrive", lambda: self._use(od), bg=C["accent"], fg=C["accent_fg"],
+                  font=f(9, "bold")).pack(side="left")
+        mkbtn(row, "Choose folder…", self._choose, bg=C["panel"]).pack(side="left", padx=(6, 0))
+        mkbtn(row, "Back to default", lambda: self._use(DATA_DIR), bg=C["panel"]).pack(side="left", padx=(6, 0))
+        row2 = tk.Frame(self, bg=C["bg"])
+        row2.pack(fill="x", pady=(6, 0))
+        mkbtn(row2, "Open folder", lambda: os.startfile(app.store.data_dir), bg=C["panel"]).pack(side="left")
+        mkbtn(row2, "Open backups", self._backups, bg=C["panel"]).pack(side="left", padx=(6, 0))
+        mkbtn(row2, "Close", self.destroy, bg=C["panel"]).pack(side="right")
+        self.status = tk.Label(self, text="", bg=C["bg"], fg=C["ok"], font=f(9), anchor="w")
+        self.status.pack(fill="x", pady=(8, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+        dark_titlebar(self)
+        self.update_idletasks()
+        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_reqwidth()) // 2}+{self.winfo_screenheight() // 4}")
+        self.focus_force()
+
+    def _use(self, folder):
+        if self.app.move_data(folder):
+            self.path.config(text=self.app.store.data_dir)
+            self.status.config(text="Saved. Reminders are stored here now.", fg=C["ok"])
+
+    def _choose(self):
+        d = filedialog.askdirectory(parent=self, title="Folder for your reminders")
+        if d:
+            self._use(d)
+
+    def _backups(self):
+        p = os.path.join(self.app.store.data_dir, "backups")
+        os.makedirs(p, exist_ok=True)
+        os.startfile(p)
 
 
 class ThemeDialog(tk.Toplevel):
@@ -1515,9 +1801,12 @@ class BigCalendar(tk.Toplevel):
         for w in self.bar.winfo_children() + self.body.winfo_children():
             w.destroy()
         self.tree = None
+        self.unbind("<MouseWheel>")
         self._bar()
         if self.mode == "month":
             self._month()
+        elif self.mode == "agenda":
+            self._agenda()
         else:
             self._list()
         self.app.bind_menu(self.bar)
@@ -1530,6 +1819,9 @@ class BigCalendar(tk.Toplevel):
                      fg=C["fg"], font=fh(17)).pack(side="left", padx=4)
             mkbtn(b, "\u203a", lambda: self.shift(1), bg=C["bg"], font=f(16), padx=6, pady=0).pack(side="left")
             mkbtn(b, "Today", self.goto_today, bg=C["panel"], font=f(9)).pack(side="left", padx=(10, 0))
+        elif self.mode == "agenda":
+            tk.Label(b, text=heading("Next 14 days"), bg=C["bg"], fg=C["fg"],
+                     font=fh(17)).pack(side="left")
         else:
             tk.Label(b, text=heading("All reminders"), bg=C["bg"], fg=C["fg"],
                      font=fh(17)).pack(side="left")
@@ -1542,7 +1834,7 @@ class BigCalendar(tk.Toplevel):
               font=f(9, "bold")).pack(side="right", padx=(6, 0))
         seg = tk.Frame(b, bg=C["border"], padx=1, pady=1)
         seg.pack(side="right", padx=(0, 10))
-        for mode, label in (("month", "Month"), ("list", "List")):
+        for mode, label in (("month", "Month"), ("agenda", "Agenda"), ("list", "List")):
             on = self.mode == mode
             mkbtn(seg, label, lambda m=mode: self.set_mode(m), bg=C["accent"] if on else C["panel"],
                   fg=C["accent_fg"] if on else C["fg"], font=f(9)).pack(side="left")
@@ -1585,7 +1877,9 @@ class BigCalendar(tk.Toplevel):
                 limit = 3
                 for r in evs[:limit]:
                     done = r.get("done")
-                    label = (short_time(r.get("time")) + " " if r.get("time") else "") + r["title"]
+                    label = (("! " if r.get("important") else "")
+                             + (short_time(r.get("time")) + " " if r.get("time") else "") + r["title"]
+                             + (f"  {progress(r)}" if r.get("checklist") else ""))
                     chip = tk.Label(cell, text=label, anchor="w", padx=4, cursor="hand2",
                                     bg=bg if done else cat_color(r),
                                     fg=C["faint"] if done else C["chip_fg"],
@@ -1599,6 +1893,75 @@ class BigCalendar(tk.Toplevel):
                     more.pack(fill="x", padx=6)
                     more.bind("<Button-1>", lambda e, dd=d: app.open_day(dd))
 
+    def _agenda(self):
+        app = self.app
+        today, now = date.today(), datetime.now()
+        canvas = tk.Canvas(self.body, bg=C["bg"], highlightthickness=0)
+        sb = ttk.Scrollbar(self.body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=C["bg"])
+        canvas.create_window((0, 0), window=inner, anchor="nw", tags="inner")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("inner", width=e.width))
+
+        def wheel(e):
+            try:
+                canvas.yview_scroll(int(-e.delta / 120), "units")
+            except tk.TclError:
+                pass
+        self.bind("<MouseWheel>", wheel)
+
+        def section(title, color, items, day=None):
+            tk.Label(inner, text=heading(title, spaced=False), bg=C["bg"], fg=color, font=fh(11),
+                     anchor="w").pack(fill="x", pady=(14, 4))
+            for r in items:
+                row = tk.Frame(inner, bg=C["panel"], padx=12, pady=7, cursor="hand2")
+                row.pack(fill="x", pady=2)
+                tk.Frame(row, bg=cat_color(r), width=4).pack(side="left", fill="y", padx=(0, 10))
+                when = fmt_time(r.get("time")) or "All day"
+                if day is None:
+                    when = f"{date.fromisoformat(r['date']):%d %b}"
+                tk.Label(row, text=when, width=9, anchor="w", bg=C["panel"], fg=C["dim"],
+                         font=f(10)).pack(side="left")
+                title_txt = ("! " if r.get("important") else "") + r["title"]
+                tk.Label(row, text=title_txt, anchor="w", bg=C["panel"],
+                         fg=C["danger"] if r.get("important") else C["fg"],
+                         font=f(11, "bold") if r.get("important") else f(11)).pack(side="left")
+                if r.get("repeat", "none") != "none":
+                    tk.Label(row, text="↻", bg=C["panel"], fg=C["dim"], font=f(10)).pack(side="left", padx=6)
+                if r.get("link"):
+                    link = r["link"]
+                    mkbtn(row, "Open ↗", lambda u=link: open_link(u), bg=C["bg"], fg=C["accent"],
+                          font=f(9), padx=8, pady=2).pack(side="right")
+                if r.get("checklist"):
+                    tk.Label(row, text=f"☑ {progress(r)}", bg=C["panel"], fg=C["ok"],
+                             font=f(9)).pack(side="right", padx=8)
+                tk.Label(row, text=r.get("category") or "Personal", bg=C["panel"], fg=cat_color(r),
+                         font=f(9)).pack(side="right", padx=8)
+                for w in row.winfo_children() + [row]:
+                    if not isinstance(w, tk.Label) or w.cget("cursor") != "hand2" or w.cget("text") != "Open ↗":
+                        w.bind("<Button-1>", lambda e, rr=r: app.edit(rr))
+
+        pending = app.store.pending()
+        overdue = [r for r in pending if app.countdown(r, now)[0] == "overdue"]
+        if overdue:
+            section("Overdue", C["danger"], sorted(overdue, key=app.store.effective))
+        shown = 0
+        for i in range(14):
+            d = today + timedelta(days=i)
+            items = [r for r in pending if occurs_on(r, d) and r not in overdue]
+            if not items:
+                continue
+            items.sort(key=lambda r: r.get("time") or "00:00")
+            label = ("Today · " if i == 0 else "Tomorrow · " if i == 1 else "") + fmt_date(d)
+            section(label, C["accent"] if i == 0 else C["fg"], items, day=d)
+            shown += 1
+        if not shown and not overdue:
+            tk.Label(inner, text="Nothing in the next two weeks. Enjoy the calm ☕",
+                     bg=C["bg"], fg=C["dim"], font=f(11)).pack(anchor="w", pady=20)
+
     def _list(self):
         top = tk.Frame(self.body, bg=C["bg"])
         top.pack(fill="x", pady=(0, 8))
@@ -1611,6 +1974,7 @@ class BigCalendar(tk.Toplevel):
         mkbtn(top, "Delete", self._delete, bg=C["panel"], fg=C["danger"]).pack(side="right", padx=(6, 0))
         mkbtn(top, "Restore", self._restore, bg=C["panel"]).pack(side="right", padx=(6, 0))
         mkbtn(top, "\u2713 Mark done", self._done, bg=C["panel"], fg=C["ok"]).pack(side="right", padx=(6, 0))
+        mkbtn(top, "Open link \u2197", self._open_link, bg=C["panel"]).pack(side="right", padx=(6, 0))
         tk.Label(top, text="Double-click to edit  \u00b7  Ctrl/Shift-click to select several",
                  bg=C["bg"], fg=C["faint"], font=f(8)).pack(side="right", padx=10)
 
@@ -1660,8 +2024,11 @@ class BigCalendar(tk.Toplevel):
             status, color = self.app.countdown(r)
             tag = ("done" if r.get("done") else "overdue" if color == C["danger"]
                    else "soon" if color in (C["orange"], C["warn"]) else "")
+            title = (("! " if r.get("important") else "") + r["title"]
+                     + (f"   ☑ {progress(r)}" if r.get("checklist") else "")
+                     + ("   ↗" if r.get("link") else ""))
             tree.insert("", "end", iid=r["id"], tags=(tag,), values=(
-                format_when(r), r["title"], r.get("category") or "Personal",
+                format_when(r), title, r.get("category") or "Personal",
                 dict(REPEATS)[r.get("repeat", "none")] if r.get("repeat", "none") != "none" else "\u2014",
                 status))
 
@@ -1675,33 +2042,48 @@ class BigCalendar(tk.Toplevel):
         if sel:
             self.app.edit(sel[0])
 
-    def _done(self):
+    def _open_link(self):
         for r in self._selected():
-            if not r.get("done"):
-                self.app.close_toast(r["id"])
-                self.app.store.complete(r["id"])
-        self.app.changed()
+            if r.get("link"):
+                open_link(r["link"])
+
+    @staticmethod
+    def _what(sel):
+        return f"“{sel[0]['title']}”" if len(sel) == 1 else f"{len(sel)} reminders"
+
+    def _done(self):
+        sel = [r for r in self._selected() if not r.get("done")]
+        if not sel:
+            return
+        ids = [r["id"] for r in sel]
+        for rid in ids:
+            self.app.close_toast(rid)
+        self.app.with_undo("Marked done", f"{self._what(sel)} marked done.",
+                           lambda: [self.app.store.complete(rid) for rid in ids])
 
     def _restore(self):
-        for r in self._selected():
-            if r.get("done"):
+        sel = [r for r in self._selected() if r.get("done")]
+        if not sel:
+            return
+
+        def act():
+            for r in sel:
                 r["done"] = False
                 r["fired_main"] = r["fired_advance"] = True   # don't pop up instantly
                 self.app.shown.add(r["id"])
-        self.app.store.save()
-        self.app.changed()
+        self.app.with_undo("Restored", f"{self._what(sel)} restored.", act)
 
     def _delete(self):
         sel = self._selected()
         if not sel:
             return
-        what = f"\"{sel[0]['title']}\"" if len(sel) == 1 else f"{len(sel)} reminders"
-        if messagebox.askyesno("Delete", f"Delete {what}? This can't be undone.", parent=self):
-            for r in sel:
-                self.app.close_toast(r["id"])
-                self.app.store.reminders = [x for x in self.app.store.reminders if x["id"] != r["id"]]
-            self.app.store.save()
-            self.app.changed()
+        ids = {r["id"] for r in sel}
+        for rid in ids:
+            self.app.close_toast(rid)
+
+        def act():
+            self.app.store.reminders = [x for x in self.app.store.reminders if x["id"] not in ids]
+        self.app.with_undo("Deleted", f"{self._what(sel)} deleted.", act)
 
 
 # ---------------------------------------------------------------- main widget
@@ -1715,7 +2097,10 @@ class App:
         self.store.settings["theme"] = self.wanted_theme() or self.store.settings["theme"]
         C.clear()
         C.update(THEMES[self.store.settings["theme"]])
-        self.s = root.winfo_fpixels("1i") / 96.0
+        UI["scale"] = float(self.store.settings.get("size") or 1.0)
+        self.s = root.winfo_fpixels("1i") / 96.0 * UI["scale"]
+        self.undo_state = None
+        self._cur_alpha = None
         self.toasts = {}
         self.shown = set()          # reminders already popped up this session
         self.dialog = None
@@ -1741,7 +2126,7 @@ class App:
         root.overrideredirect(True)
         root.configure(bg=C["border"])
         root.attributes("-topmost", self.store.settings["topmost"])
-        root.attributes("-alpha", self.store.settings["alpha"])
+        self.update_alpha()
         self.frame = tk.Frame(root, bg=C["bg"])
         self.frame.pack(fill="both", expand=True, padx=2, pady=2)
         self._blink_on = False
@@ -1816,16 +2201,31 @@ class App:
         self.v_hold = tk.BooleanVar(value=st["hold_fullscreen"])
         m.add_checkbutton(label="Hold pop-ups during fullscreen", variable=self.v_hold,
                           command=lambda: self._set("hold_fullscreen", self.v_hold.get()))
+        self.v_nag = tk.BooleanVar(value=st["nag"])
+        m.add_checkbutton(label="Shake ignored pop-ups again every 5 min", variable=self.v_nag,
+                          command=lambda: self._set("nag", self.v_nag.get()))
+        self.v_sound = tk.BooleanVar(value=st["sound"])
+        m.add_checkbutton(label="Sound with pop-ups", variable=self.v_sound,
+                          command=lambda: self._set("sound", self.v_sound.get()))
         if not FROZEN and os.path.isdir(os.path.join(APP_DIR, ".git")):
             self.v_upd = tk.BooleanVar(value=st["auto_update"])
             m.add_checkbutton(label="Auto-update from GitHub", variable=self.v_upd,
                               command=lambda: self._set("auto_update", self.v_upd.get()))
         self.v_alpha = tk.DoubleVar(value=st["alpha"])
         op = tk.Menu(m, tearoff=0)
-        for a in (1.0, 0.97, 0.85, 0.7):
-            op.add_radiobutton(label=f"{int(a * 100)}%", variable=self.v_alpha, value=a,
-                               command=self.set_alpha)
-        m.add_cascade(label="Opacity", menu=op)
+        for a, lbl in ((1.0, "100%  (solid)"), (0.9, "90%"), (0.85, "85%"), (0.75, "75%"), (0.6, "60%")):
+            op.add_radiobutton(label=lbl, variable=self.v_alpha, value=a, command=self.set_alpha)
+        op.add_separator()
+        self.v_hover = tk.BooleanVar(value=st["solid_on_hover"])
+        op.add_checkbutton(label="Solid while the mouse is over it", variable=self.v_hover,
+                           command=lambda: (self._set("solid_on_hover", self.v_hover.get()), self.update_alpha()))
+        m.add_cascade(label="Translucency", menu=op)
+        self.v_size = tk.DoubleVar(value=st["size"])
+        sz = tk.Menu(m, tearoff=0)
+        for v, lbl in ((0.85, "Small"), (1.0, "Normal"), (1.2, "Large"), (1.4, "Extra large")):
+            sz.add_radiobutton(label=lbl, variable=self.v_size, value=v,
+                               command=lambda: self.set_size(self.v_size.get()))
+        m.add_cascade(label="Size", menu=sz)
         self.v_allday = tk.StringVar(value=st["allday_time"])
         ad = tk.Menu(m, tearoff=0)
         for t in ("07:00", "08:00", "09:00", "10:00", "12:00"):
@@ -1843,12 +2243,34 @@ class App:
         m.add_command(label="Phone alerts\u2026", command=lambda: self._open_dialog(lambda: PhoneDialog(self)))
         m.add_command(label="Import .ics\u2026", command=self.import_ics)
         m.add_command(label="Export .ics\u2026", command=self.export_ics)
-        m.add_command(label="Open data folder", command=lambda: os.startfile(DATA_DIR))
+        m.add_command(label="Data, sync & backups…",
+                      command=lambda: self._open_dialog(lambda: DataDialog(self)))
         m.add_separator()
         if self.tray:
             m.add_command(label="Hide to tray", command=self.hide_widget)
         m.add_command(label="Quit", command=self.quit)
+        m.add_command(label=f"Mini Floating Calendar {VERSION}", state="disabled")
         return m
+
+    def update_alpha(self):
+        """Translucent normally; solid while hovered or while a reminder is waiting."""
+        st = self.store.settings
+        a = float(st.get("alpha", 1.0))
+        if a < 1.0:
+            waiting = any(isinstance(t, Toast) for t in self.toasts.values())
+            hovered = False
+            if st.get("solid_on_hover", True):
+                try:
+                    x, y = self.root.winfo_pointerxy()
+                    rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+                    hovered = rx <= x < rx + self.root.winfo_width() and ry <= y < ry + self.root.winfo_height()
+                except tk.TclError:
+                    pass
+            if waiting or hovered or self._drag is not None:
+                a = 1.0
+        if a != self._cur_alpha:
+            self.root.attributes("-alpha", a)
+            self._cur_alpha = a
 
     def _set(self, key, value, rerender=False):
         self.store.settings[key] = value
@@ -1956,6 +2378,10 @@ class App:
                            "A newer version was downloaded from GitHub. Restart to use it.",
                            [("Restart now", self.restart), ("Later", None)])
         except queue.Empty:
+            pass
+        try:
+            self.update_alpha()
+        except Exception:
             pass
         if self.lock is not None:
             try:
@@ -2148,14 +2574,23 @@ class App:
             label, color = self.countdown(r, now, compact=True)
             row = tk.Frame(box, bg=C["bg"], cursor="hand2")
             row.pack(fill="x", pady=1)
-            title_txt = r["title"] if len(r["title"]) <= 22 else r["title"][:21] + "\u2026"
+            imp = r.get("important")
+            limit = 18 if r.get("checklist") else 22
+            title_txt = ("! " if imp else "") + r["title"]
+            if len(title_txt) > limit:
+                title_txt = title_txt[:limit - 1] + "\u2026"
             if r.get("repeat", "none") != "none":
                 title_txt += "  \u21bb"
             ws_ = [tk.Label(row, text="\u25cf", bg=C["bg"], fg=cat_color(r), font=f(8)),
-                   tk.Label(row, text=title_txt, bg=C["bg"], fg=C["fg"], font=f(9), anchor="w"),
+                   tk.Label(row, text=title_txt, bg=C["bg"], fg=C["danger"] if imp else C["fg"],
+                            font=f(9, "bold") if imp else f(9), anchor="w"),
                    tk.Label(row, text=label, bg=C["bg"], fg=color, font=f(8, "bold"))]
+            if r.get("checklist"):
+                ws_.append(tk.Label(row, text=progress(r), bg=C["bg"], fg=C["dim"], font=f(8)))
             ws_[0].pack(side="left", padx=(0, 6))
             ws_[2].pack(side="right")
+            if len(ws_) > 3:
+                ws_[3].pack(side="right", padx=(0, 6))
             ws_[1].pack(side="left", fill="x", expand=True)
             for w in [row] + ws_:
                 w.bind("<Button-1>", lambda e, rr=r: self.edit(rr))
@@ -2248,6 +2683,10 @@ class App:
         C.update(THEMES[name])
         self.v_theme.set(name)
         self._set("theme", name)
+        self.rebuild_ui()
+
+    def rebuild_ui(self):
+        """Redraw every window after a theme or size change."""
         self._style()
         self.root.configure(bg=C["border"])
         self.frame.configure(bg=C["bg"])
@@ -2301,7 +2740,60 @@ class App:
 
     def set_alpha(self):
         self._set("alpha", self.v_alpha.get())
-        self.root.attributes("-alpha", self.v_alpha.get())
+        self.update_alpha()
+
+    def set_size(self, v):
+        self._set("size", v)
+        UI["scale"] = v
+        self.s = self.root.winfo_fpixels("1i") / 96.0 * v
+        self.rebuild_ui()
+
+    def with_undo(self, head, text, action):
+        """Run a change, save it, and offer an Undo card for 8 seconds."""
+        before = copy.deepcopy(self.store.reminders)
+        action()
+        self.store.save()
+        self.changed()
+        self.undo_state = before
+        Notice(self, "__undo__", head, text, [("Undo", self.undo), ("OK", None)], timeout=8000)
+
+    def undo(self):
+        if self.undo_state is None:
+            return
+        self.store.reminders, self.undo_state = self.undo_state, None
+        self.store.save()
+        self.changed()
+
+    def complete_with_undo(self, rid):
+        r = self.store.get(rid)
+        if not r:
+            return
+        nxt = "" if r.get("repeat", "none") == "none" else " Next one is scheduled."
+        self.with_undo("Done", f"“{r['title']}” marked done.{nxt}",
+                       lambda: self.store.complete(rid))
+
+    def move_data(self, new_dir):
+        """Store reminders in another folder (e.g. OneDrive). Merges with any reminders already there."""
+        new_dir = os.path.normpath(os.path.abspath(new_dir))
+        same = lambda a, b: os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+        try:
+            os.makedirs(new_dir, exist_ok=True)
+            target = os.path.join(new_dir, "reminders.json")
+            merged = list(self.store.reminders)
+            if not same(target, self.store.rem_file) and os.path.exists(target):
+                with open(target, encoding="utf-8") as fh_:
+                    other = json.load(fh_)
+                have = {r["id"] for r in merged}
+                merged += [r for r in other if isinstance(r, dict) and r.get("id") not in have]
+            self.store.settings["data_dir"] = None if same(new_dir, DATA_DIR) else new_dir
+            self.store.reminders = merged
+            self.store.save()
+            self.store.save_settings()
+        except (OSError, ValueError) as e:
+            messagebox.showerror(TITLE, f"Couldn't use that folder:\n{e}", parent=self.root)
+            return False
+        self.changed()
+        return True
 
     def toggle_startup(self):
         try:
@@ -2418,9 +2910,12 @@ class App:
                 self.root.configure(bg=C["danger"] if on else C["accent"])
                 for t in waiting:
                     t.outer.configure(bg=C["danger"] if on else t.stripe)
-                    t.configure(bg=C["danger"] if on else C["border"])
+                    t.configure(bg=C["danger"] if on else (C["accent"] if t.important else C["border"]))
                 if self.tray:
                     self.tray.icon = self._tray_img(alert=on)
+                now = time.monotonic()
+                if self.store.settings.get("nag", True) and any(now - t.last_nag >= NAG_SECONDS for t in waiting):
+                    self.nag(waiting, now)
             elif self._alerting:
                 self._blink_on = False
                 self.root.configure(bg=C["border"])
@@ -2430,6 +2925,39 @@ class App:
         except Exception:
             log_error(traceback.format_exc())
         self.root.after(600, self.blink)
+
+    def nag(self, waiting, now=None):
+        """An ignored reminder: jump back on top and shake (no sound)."""
+        now = now or time.monotonic()
+        self.restack_toasts()
+        for t in waiting:
+            t.last_nag = now
+            try:
+                t.lift()
+                t.attributes("-topmost", True)
+            except tk.TclError:
+                continue
+            self.shake(t)
+        if self.root.state() != "withdrawn":
+            self.root.lift()
+            self.shake(self.root)
+
+    def shake(self, win):
+        try:
+            x, y = win.winfo_x(), win.winfo_y()
+        except tk.TclError:
+            return
+        offsets = [14, -14, 11, -11, 8, -8, 5, -5, 2, 0]
+
+        def step(i=0):
+            if i >= len(offsets):
+                return
+            try:
+                win.geometry(f"+{x + offsets[i]}+{y}")
+                win.after(35, step, i + 1)
+            except tk.TclError:
+                pass
+        step()
 
     def _tray_img(self, alert):
         key = "_img_alert" if alert else "_img_normal"
@@ -2511,6 +3039,13 @@ class App:
             w = self.wanted_theme()
             if w and w != self.store.settings["theme"]:
                 self.apply_theme(w, manual=False)
+            if self.store.changed_on_disk() and self.store.reload():
+                # another PC changed the synced reminders file
+                for rid, card in list(self.toasts.items()):
+                    r = self.store.get(rid)
+                    if isinstance(card, Toast) and (r is None or r.get("done")):
+                        card.close()
+                self.changed()
             self.check_reminders()
             today = date.today()
             if today != self.last_day:

@@ -6,7 +6,12 @@ with a vintage-almanac look and three other themes.
 ## Features
 
 **Reminders that you won't miss**
-- A pop-up card appears in the bottom-right corner with a sound. **It blinks** (the card edge, the widget border and the tray icon) until you click **Done** or **Snooze** (10 min / 1 hr / tomorrow).
+- A pop-up card appears in the bottom-right corner. **It blinks** (the card edge, the widget border and the tray icon) until you click **Done** or **Snooze** (10 min / 1 hr / tomorrow).
+- Ignore it and every 5 minutes it **shakes and jumps back to the front**. There's no extra noise, and the sound can be switched off completely.
+- **Important** reminders (tick the box, or type `!` in quick add) get a thick blinking frame and show in red.
+- **Links**: attach the application page or form. The pop-up gets an **Open link** button.
+- **Checklists**: e.g. ☐ transcript ☐ ID copy ☐ SOP. Tick items right on the pop-up. Progress such as "2/3" shows everywhere.
+- **Undo**: after Done or Delete, an Undo button appears for 8 seconds.
 - Reminders with a time fire at that time. All-day reminders fire that morning (9:00 AM by default).
 - Early warnings: a "Coming up" card 1, 2, 3 or 7 days before.
 - If your PC was off when a reminder was due, it shows up as **Missed** the next time the app starts.
@@ -32,7 +37,10 @@ Categories: `#personal #work #college #bills #health #other`.
 **Calendar views**
 - **Floating widget**: a month view plus your next reminders with countdowns ("3d left", "tomorrow", "overdue"). Drag it anywhere, or click `–` to shrink it to one line.
 - **Big calendar** (`▦` button): a full-size month table with each reminder shown in its day, colour-coded by category.
+- **Agenda view**: what's overdue, then the next 14 days, day by day.
 - **List view**: every reminder in one table. Search it, filter by Upcoming / Done / All, mark as done, restore, or delete.
+- **Translucent**: the widget is see-through when the mouse isn't on it and turns solid when you hover or a reminder is waiting. Set it under right-click → Translucency.
+- **Size**: Small / Normal / Large / Extra large.
 
 **Lives in the tray**
 - The `×` button hides the widget to the system tray, including the `^` hidden-icons area. Click the tray icon to bring it back, or right-click it for a menu.
@@ -43,11 +51,14 @@ Categories: `#personal #work #college #bills #health #other`.
 - **Automatic light/dark**: a light theme during the day and a dark one at night (7 AM / 7 PM by default), or follow Windows' own light/dark setting. Set the themes and times under **Theme → Light / dark timings…**. Picking a theme by hand turns automatic switching off.
 
 **Other features**
+- **OneDrive sync and daily backups**: right-click → *Data, sync & backups…* → *Use OneDrive*. Reminders are then backed up in the cloud and shared with any other PC that uses the same folder. A daily copy is also kept for 14 days.
 - Repeating reminders: daily, weekly, monthly, yearly.
 - Import and export `.ics` files to move reminders to or from Google Calendar and Outlook.
 - Auto-updates from this GitHub repo when it runs from a git clone.
 
 ## Install
+
+**Easiest: download the `.exe`** from the [Releases page](https://github.com/Kristiano717/MiniFloatingCalendar/releases/latest). No Python needed.
 
 **Option A: run the Python script** (gets auto-updates)
 1. Install [Python 3.9+](https://www.python.org/downloads/).
@@ -69,6 +80,12 @@ This creates `dist\MiniFloatingCalendar.exe`, which you can copy to any Windows 
 1. Install **ntfy** on your phone (Play Store or App Store).
 2. On the PC, right-click the widget, choose **Phone alerts…**, and copy the topic name shown.
 3. In the ntfy app, tap **+** and subscribe to that topic. Click **Send test**, then **Save**.
+
+## Development
+```powershell
+python -m unittest discover -s tests -v
+```
+GitHub runs these tests on every push. Pushing a tag such as `v2.1.0` builds the `.exe` and publishes it as a release.
 
 ## Where your data lives
 `%APPDATA%\MiniFloatingCalendar\reminders.json` (plain JSON). To open the folder, right-click the widget and choose **Open data folder**.
