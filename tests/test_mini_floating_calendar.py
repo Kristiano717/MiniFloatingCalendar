@@ -136,6 +136,18 @@ class AppTests(unittest.TestCase):
             self.root.mainloop()
         self.root.update()
 
+    def wait_until(self, cond, timeout=5.0):
+        """Let animations run until cond() is true (slow CI machines need longer)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            self.pump(50)
+            try:
+                if cond():
+                    return True
+            except tk.TclError:
+                pass
+        return False
+
     def add(self, rid, **kw):
         now = datetime.now()
         r = {"id": rid, "title": rid, "date": now.date().isoformat(), "time": "", "advance": 0,
@@ -232,31 +244,30 @@ class AppTests(unittest.TestCase):
         try:
             self.app.quick_add()
             qa = self.app.qa
-            self.pump(600)
-            self.assertAlmostEqual(float(qa.attributes("-alpha")), 1.0, places=2)
+            self.assertTrue(self.wait_until(lambda: float(qa.attributes("-alpha")) > 0.99), "quick add fades in")
             qa.destroy()                       # fades out, then really closes
             self.assertTrue(qa.winfo_exists())
-            self.pump(400)
-            self.assertFalse(qa.winfo_exists())
+            self.assertTrue(self.wait_until(lambda: not qa.winfo_exists()), "quick add closes")
             # pop-up glides in from the right and ends in its slot
             self.add("now", time=(datetime.now() - timedelta(minutes=1)).strftime("%H:%M"))
             self.app.check_reminders()
             card = self.app.toasts["now"]
-            self.pump(700)
             l, t, r, b = mfc.work_area(self.root)
-            self.assertLess(abs(card.winfo_x() + card.winfo_width() - (r - int(12 * self.app.s))), 4)
+            right = r - int(12 * self.app.s)
+            self.assertTrue(self.wait_until(
+                lambda: abs(card.winfo_x() + card.winfo_width() - right) < 4
+                and getattr(card, "_anim_token", None) is not None and float(card.attributes("-alpha")) > 0.99),
+                "card slides into place")
             card.close()
-            self.pump(400)
-            self.assertFalse(card.winfo_exists())
+            self.assertTrue(self.wait_until(lambda: not card.winfo_exists()), "card slides away")
             # hide to tray / show again (tray isn't running in tests, so pretend)
             self.app.tray = object()
             self.app.store.settings["tray_hint_shown"] = True
             self.app.hide_widget()
-            self.pump(400)
-            self.assertEqual(self.root.state(), "withdrawn")
+            self.assertTrue(self.wait_until(lambda: self.root.state() == "withdrawn"), "widget hides")
             self.app.show()
-            self.pump(600)
-            self.assertEqual(self.root.state(), "normal")
+            self.assertTrue(self.wait_until(lambda: self.root.state() == "normal" and not self.app._animating),
+                            "widget shows")
             self.app.tray = None
         finally:
             mfc.ANIM["on"] = False
