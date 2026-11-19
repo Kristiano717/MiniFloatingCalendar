@@ -277,7 +277,7 @@ class AppTests(unittest.TestCase):
         self.pump(200)
         if not self.app.glass:
             self.skipTest("acrylic glass not available on this Windows")
-        self.assertEqual(self.root.attributes("-transparentcolor"), mfc.C["bg"])
+        self.assertEqual(str(self.root.attributes("-transparentcolor")).lower(), mfc.C["bg"])
         self.assertEqual(self.app.catcher.state(), "normal")
         # a click that lands on the glass between letters reaches the day underneath
         opened = []
