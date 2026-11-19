@@ -58,6 +58,13 @@ THEMES = {
         accent="#b5432a", accent_fg="#fbf3e2", event="#e3c890", ok="#5f7a3a",
         danger="#a8231a", warn="#b7791f", orange="#c2611f", border="#8a6a45",
         chip_fg="#fbf3e2"),
+    "Daylight": dict(
+        dark=False, F="Segoe UI", FH="Segoe UI Semibold", FM="Consolas",
+        upper=False, spaced=False, orn=("", ""),
+        bg="#f7f7fa", panel="#ebecf2", fg="#1f2230", dim="#6b6f80", faint="#a3a7b5",
+        accent="#4f6bed", accent_fg="#ffffff", event="#dde4ff", ok="#2f9e6a",
+        danger="#d64545", warn="#c98a00", orange="#e07a1f", border="#c9ccd6",
+        chip_fg="#ffffff"),
     "Midnight Noir": dict(
         dark=True, F="Segoe UI", FH="Segoe UI Semibold", FM="Consolas",
         upper=False, spaced=False, orn=("", ""),
@@ -116,7 +123,23 @@ DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 1.0,
                     "collapsed": False, "hidden": False, "allday_time": "09:00",
                     "week_start": 0, "theme": DEFAULT_THEME, "hold_fullscreen": True,
                     "auto_update": True, "phone_topic": "", "big_geom": None,
-                    "tray_hint_shown": False}
+                    "tray_hint_shown": False,
+                    # automatic light/dark: "off", "schedule" (by time) or "windows" (follow Windows)
+                    "auto_theme": "schedule", "light_theme": DEFAULT_THEME,
+                    "dark_theme": "Midnight Noir", "light_start": "07:00", "dark_start": "19:00"}
+AUTO_MODES = [("off", "Fixed theme (no switching)"), ("schedule", "Switch light/dark by time"),
+              ("windows", "Follow Windows light/dark setting")]
+
+
+def windows_light():
+    """True if Windows apps are set to light mode, False for dark, None if unknown."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return bool(winreg.QueryValueEx(k, "AppsUseLightTheme")[0])
+    except (OSError, ImportError):
+        return None
 
 REPEATS = [("none", "Does not repeat"), ("daily", "Every day"), ("weekly", "Every week"),
            ("monthly", "Every month"), ("yearly", "Every year")]
@@ -1336,6 +1359,106 @@ class PhoneDialog(tk.Toplevel):
         self.destroy()
 
 
+class ThemeDialog(tk.Toplevel):
+    """Pick the light theme, the dark theme, and when to switch between them."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        st = app.store.settings
+        self.title("Light & dark timings")
+        self.configure(bg=C["bg"], padx=18, pady=16)
+        self.attributes("-topmost", True)
+        self.resizable(False, False)
+        tk.Label(self, text=heading("Light & dark timings", spaced=False), bg=C["bg"],
+                 fg=C["accent"], font=fh(11)).pack(anchor="w", pady=(0, 8))
+
+        self.v_mode = tk.StringVar(value=st.get("auto_theme", "off"))
+        for val, lbl in AUTO_MODES:
+            tk.Radiobutton(self, text=lbl, variable=self.v_mode, value=val, command=self._sync,
+                           bg=C["bg"], fg=C["fg"], selectcolor=C["panel"], activebackground=C["bg"],
+                           activeforeground=C["fg"], font=f(10), anchor="w").pack(fill="x")
+
+        g = tk.Frame(self, bg=C["bg"])
+        g.pack(fill="x", pady=(12, 0))
+        names = list(THEMES)
+
+        def lab(text, r, c):
+            tk.Label(g, text=text, bg=C["bg"], fg=C["dim"], font=f(9)).grid(
+                row=r, column=c, sticky="w", pady=(6, 2), padx=(0 if c == 0 else 14, 0))
+        self.v_light = tk.StringVar(value=st.get("light_theme", DEFAULT_THEME))
+        self.v_dark = tk.StringVar(value=st.get("dark_theme", "Midnight Noir"))
+        self.v_ls = tk.StringVar(value=fmt_time(st.get("light_start", "07:00")))
+        self.v_ds = tk.StringVar(value=fmt_time(st.get("dark_start", "19:00")))
+        lab("☀  Light theme", 0, 0)
+        lab("☾  Dark theme", 0, 1)
+        ttk.Combobox(g, textvariable=self.v_light, values=names, state="readonly",
+                     width=18).grid(row=1, column=0, sticky="we")
+        ttk.Combobox(g, textvariable=self.v_dark, values=names, state="readonly",
+                     width=18).grid(row=1, column=1, sticky="we", padx=(14, 0))
+        lab("Light from", 2, 0)
+        lab("Dark from", 2, 1)
+        self.e_ls = entry(g, self.v_ls, 18)
+        self.e_ds = entry(g, self.v_ds, 18)
+        for e in (self.e_ls, self.e_ds):
+            e.config(disabledbackground=C["panel"], disabledforeground=C["faint"])
+        self.e_ls.grid(row=3, column=0, sticky="we", ipady=4)
+        self.e_ds.grid(row=3, column=1, sticky="we", ipady=4, padx=(14, 0))
+
+        chips = tk.Frame(self, bg=C["bg"])
+        chips.pack(fill="x", pady=(8, 0))
+        tk.Label(chips, text="Presets:", bg=C["bg"], fg=C["faint"], font=f(8)).pack(side="left")
+        for lbl, a, b in (("7 am / 7 pm", "07:00", "19:00"), ("6 am / 6 pm", "06:00", "18:00"),
+                          ("8 am / 9 pm", "08:00", "21:00")):
+            mkbtn(chips, lbl, lambda a=a, b=b: self._preset(a, b), bg=C["panel"], font=f(8),
+                  padx=7, pady=2).pack(side="left", padx=(5, 0))
+
+        tk.Label(self, text="“Follow Windows” uses Settings → Personalization → Colors.",
+                 bg=C["bg"], fg=C["faint"], font=f(8), anchor="w").pack(fill="x", pady=(10, 0))
+        self.err = tk.Label(self, text="", bg=C["bg"], fg=C["danger"], font=f(9), anchor="w")
+        self.err.pack(fill="x", pady=(4, 0))
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x", pady=(8, 0))
+        mkbtn(row, "Save", self.save, bg=C["accent"], fg=C["accent_fg"], font=f(9, "bold"),
+              padx=16).pack(side="right")
+        mkbtn(row, "Cancel", self.destroy, bg=C["panel"]).pack(side="right", padx=(0, 6))
+        self.bind("<Escape>", lambda ev: self.destroy())
+        self._sync()
+        dark_titlebar(self)
+        self.update_idletasks()
+        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_reqwidth()) // 2}+{self.winfo_screenheight() // 4}")
+        self.focus_force()
+
+    def _preset(self, a, b):
+        self.v_mode.set("schedule")
+        self._sync()
+        self.v_ls.set(fmt_time(a))
+        self.v_ds.set(fmt_time(b))
+
+    def _sync(self):
+        state = "normal" if self.v_mode.get() == "schedule" else "disabled"
+        self.e_ls.config(state=state)
+        self.e_ds.config(state=state)
+
+    def save(self):
+        mode = self.v_mode.get()
+        try:
+            a, b = parse_time(self.v_ls.get()), parse_time(self.v_ds.get())
+        except ValueError:
+            return self.err.config(text="Couldn't read a time. Try 7:00 am or 19:00.")
+        if mode == "schedule" and (not a or not b or a == b):
+            return self.err.config(text="Light and dark need two different times.")
+        st = self.app.store.settings
+        st.update(auto_theme=mode, light_theme=self.v_light.get(), dark_theme=self.v_dark.get(),
+                  light_start=a or st["light_start"], dark_start=b or st["dark_start"])
+        self.app.store.save_settings()
+        self.app.v_auto.set(mode)
+        self.destroy()
+        w = self.app.wanted_theme()
+        if w and w != st["theme"]:
+            self.app.apply_theme(w, manual=False)
+
+
 # ---------------------------------------------------------------- big calendar window
 
 class BigCalendar(tk.Toplevel):
@@ -1589,6 +1712,7 @@ class App:
         self.lock = lock
         self.events = queue.Queue()
         self.store = Store()
+        self.store.settings["theme"] = self.wanted_theme() or self.store.settings["theme"]
         C.clear()
         C.update(THEMES[self.store.settings["theme"]])
         self.s = root.winfo_fpixels("1i") / 96.0
@@ -1674,8 +1798,16 @@ class App:
         self.v_theme = tk.StringVar(value=st["theme"])
         th = tk.Menu(m, tearoff=0)
         for name in THEMES:
-            th.add_radiobutton(label=name, variable=self.v_theme, value=name,
+            th.add_radiobutton(label=f"{name}   ({'dark' if THEMES[name]['dark'] else 'light'})",
+                               variable=self.v_theme, value=name,
                                command=lambda n=name: self.apply_theme(n))
+        th.add_separator()
+        self.v_auto = tk.StringVar(value=st["auto_theme"])
+        for val, lbl in AUTO_MODES:
+            th.add_radiobutton(label=lbl, variable=self.v_auto, value=val,
+                               command=lambda: self.set_auto_theme(self.v_auto.get()))
+        th.add_command(label="Light / dark timings…",
+                       command=lambda: self._open_dialog(lambda: ThemeDialog(self)))
         m.add_cascade(label="Theme", menu=th)
         self.v_top = tk.BooleanVar(value=st["topmost"])
         m.add_checkbutton(label="Always on top", variable=self.v_top, command=self.toggle_top)
@@ -2083,9 +2215,38 @@ class App:
                 pass
         self.dialog = make()
 
-    def apply_theme(self, name):
+    def wanted_theme(self, now=None):
+        """The theme the light/dark schedule wants right now, or None when switching is off."""
+        st = self.store.settings
+        mode = st.get("auto_theme", "off")
+        if mode == "windows":
+            light = windows_light()
+            if light is None:
+                return None
+        elif mode == "schedule":
+            t = f"{(now or datetime.now()):%H:%M}"
+            a, b = st.get("light_start", "07:00"), st.get("dark_start", "19:00")
+            light = (a <= t < b) if a <= b else not (b <= t < a)
+        else:
+            return None
+        name = st.get("light_theme") if light else st.get("dark_theme")
+        return name if name in THEMES else None
+
+    def set_auto_theme(self, mode):
+        self._set("auto_theme", mode)
+        self.v_auto.set(mode)
+        w = self.wanted_theme()
+        if w and w != self.store.settings["theme"]:
+            self.apply_theme(w, manual=False)
+
+    def apply_theme(self, name, manual=True):
+        if manual and self.store.settings.get("auto_theme", "off") != "off":
+            # picking a theme by hand means "keep this one": stop automatic switching
+            self.store.settings["auto_theme"] = "off"
+            self.v_auto.set("off")
         C.clear()
         C.update(THEMES[name])
+        self.v_theme.set(name)
         self._set("theme", name)
         self._style()
         self.root.configure(bg=C["border"])
@@ -2347,6 +2508,9 @@ class App:
 
     def tick(self):
         try:
+            w = self.wanted_theme()
+            if w and w != self.store.settings["theme"]:
+                self.apply_theme(w, manual=False)
             self.check_reminders()
             today = date.today()
             if today != self.last_day:

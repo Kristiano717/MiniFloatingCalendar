@@ -38,7 +38,9 @@ Categories: `#personal #work #college #bills #health #other`.
 - The `×` button hides the widget to the system tray, including the `^` hidden-icons area. Click the tray icon to bring it back, or right-click it for a menu.
 - Starts with Windows. It only quits if you choose **Quit**.
 
-**Themes** (right-click → Theme): **Vintage Almanac** (default), **Midnight Noir**, **Retro Terminal**, **Synthwave '84**.
+**Themes** (right-click → Theme)
+- Light: **Vintage Almanac** (default), **Daylight**. Dark: **Midnight Noir**, **Retro Terminal**, **Synthwave '84**.
+- **Automatic light/dark**: a light theme during the day and a dark one at night (7 AM / 7 PM by default), or follow Windows' own light/dark setting. Set the themes and times under **Theme → Light / dark timings…**. Picking a theme by hand turns automatic switching off.
 
 **Other features**
 - Repeating reminders: daily, weekly, monthly, yearly.
