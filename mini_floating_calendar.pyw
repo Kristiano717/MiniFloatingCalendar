@@ -50,14 +50,29 @@ LOCK_PORT = 47613
 NO_WINDOW = 0x08000000
 HOTKEY_LABEL = "Ctrl+Alt+R"
 NTFY_SERVER = "https://ntfy.sh"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 NAG_SECONDS = 300   # ignored pop-ups shake and jump to the front again this often
 
 # ---------------------------------------------------------------- themes
 
 THEMES = {
+    # "glass": frosted-glass blur tint (ABGR) for the floating widget; bg doubles as the see-through colour.
+    "iOS Light": dict(
+        dark=False, F="Segoe UI Variable Text", FH="Segoe UI Variable Display", FM="Consolas",
+        upper=False, spaced=False, orn=("", ""), glass=0x99F7F2F2,
+        bg="#f2f2f5", panel="#ffffff", fg="#1c1c1e", dim="#6e6e73", faint="#aeaeb2",
+        accent="#007aff", accent_fg="#ffffff", event="#d9e8ff", ok="#34c759",
+        danger="#ff3b30", warn="#ff9500", orange="#ff9500", border="#d1d1d6",
+        chip_fg="#ffffff"),
+    "iOS Dark": dict(
+        dark=True, F="Segoe UI Variable Text", FH="Segoe UI Variable Display", FM="Consolas",
+        upper=False, spaced=False, orn=("", ""), glass=0xAA1E1C1C,
+        bg="#1a1a1d", panel="#2c2c2e", fg="#ffffff", dim="#98989d", faint="#5a5a5e",
+        accent="#0a84ff", accent_fg="#ffffff", event="#123e6e", ok="#30d158",
+        danger="#ff453a", warn="#ff9f0a", orange="#ff9f0a", border="#3a3a3c",
+        chip_fg="#ffffff"),
     "Vintage Almanac": dict(
-        dark=False, F="Georgia", FH="Georgia", FM="Courier New",
+        dark=False, F="Georgia", FH="Georgia", FM="Courier New", double_rule=True,
         upper=True, spaced=True, orn=("\u2726 ", " \u2726"),
         bg="#f4ead5", panel="#eadcbc", fg="#3b2a1a", dim="#7a6248", faint="#a58d6a",
         accent="#b5432a", accent_fg="#fbf3e2", event="#e3c890", ok="#5f7a3a",
@@ -92,7 +107,7 @@ THEMES = {
         danger="#ff3864", warn="#f9c80e", orange="#ff6c11", border="#7a35c9",
         chip_fg="#ffffff"),
 }
-DEFAULT_THEME = "Vintage Almanac"
+DEFAULT_THEME = "iOS Light"
 C = dict(THEMES[DEFAULT_THEME])   # current theme; replaced in place when the theme changes
 
 
@@ -139,7 +154,7 @@ DEFAULT_SETTINGS = {"x": None, "y": None, "topmost": True, "alpha": 0.85, "solid
                     "data_dir": None,
                     # automatic light/dark: "off", "schedule" (by time) or "windows" (follow Windows)
                     "auto_theme": "schedule", "light_theme": DEFAULT_THEME,
-                    "dark_theme": "Midnight Noir", "light_start": "07:00", "dark_start": "19:00"}
+                    "dark_theme": "iOS Dark", "light_start": "07:00", "dark_start": "19:00"}
 AUTO_MODES = [("off", "Fixed theme (no switching)"), ("schedule", "Switch light/dark by time"),
               ("windows", "Follow Windows light/dark setting")]
 
@@ -386,6 +401,168 @@ def foreground_fullscreen():
         return rc.l <= m.l and rc.t <= m.t and rc.r >= m.r and rc.b >= m.b
     except Exception:
         return False
+
+
+def hwnd_of(win):
+    win.update_idletasks()
+    return ctypes.windll.user32.GetParent(win.winfo_id())
+
+
+def round_window(win, small=False):
+    """Windows 11 rounded corners (with shadow) for borderless windows."""
+    try:
+        v = ctypes.c_int(3 if small else 2)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(hwnd_of(win)), 33, ctypes.byref(v), 4)
+    except Exception:
+        pass
+
+
+class _ACCENT(ctypes.Structure):
+    _fields_ = [("AccentState", ctypes.c_int), ("AccentFlags", ctypes.c_int),
+                ("GradientColor", ctypes.c_uint), ("AnimationId", ctypes.c_int)]
+
+
+class _WCAD(ctypes.Structure):
+    _fields_ = [("Attribute", ctypes.c_int), ("Data", ctypes.c_void_p), ("SizeOfData", ctypes.c_size_t)]
+
+
+def set_acrylic(win, tint):
+    """Frosted-glass (acrylic) blur behind a window; tint=0 turns it off. True if it worked."""
+    try:
+        a = _ACCENT(4 if tint else 0, 2, tint or 0, 0)
+        d = _WCAD(19, ctypes.cast(ctypes.pointer(a), ctypes.c_void_p), ctypes.sizeof(a))
+        return bool(ctypes.windll.user32.SetWindowCompositionAttribute(
+            wintypes.HWND(hwnd_of(win)), ctypes.byref(d)))
+    except Exception:
+        return False
+
+
+def set_noactivate(win):
+    """Clicking this window won't activate or raise it (used for the invisible click catcher)."""
+    try:
+        u = ctypes.windll.user32
+        get, put = u.GetWindowLongPtrW, u.SetWindowLongPtrW
+        get.restype = put.restype = ctypes.c_ssize_t
+        get.argtypes = [wintypes.HWND, ctypes.c_int]
+        put.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        h = wintypes.HWND(hwnd_of(win))
+        put(h, -20, get(h, -20) | 0x08000000 | 0x00000080)   # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    except Exception:
+        pass
+
+
+# ---- iOS-style motion
+ANIM = {"on": True}
+
+
+def ease_out_back(t, s=1.3):
+    t -= 1
+    return t * t * ((s + 1) * t + s) + 1
+
+
+def ease_out_cubic(t):
+    return 1 - (1 - t) ** 3
+
+
+def ease_in_cubic(t):
+    return t ** 3
+
+
+def animate(win, ms, frame, done=None, ease=ease_out_cubic):
+    """Call frame(progress) ~80 times a second for ms milliseconds. A new animation on the same
+    window cancels the previous one."""
+    token = object()
+    win._anim_token = token
+    if not ANIM["on"] or ms <= 0:
+        try:
+            frame(1.0)
+        except tk.TclError:
+            return
+        if done:
+            done()
+        return
+    start = time.perf_counter()
+
+    def step():
+        if getattr(win, "_anim_token", None) is not token:
+            return
+        t = min(1.0, (time.perf_counter() - start) * 1000 / ms)
+        try:
+            frame(ease(t))
+            if t < 1:
+                win.after(12, step)
+        except tk.TclError:
+            return
+        if t >= 1 and done:
+            done()
+    step()
+
+
+def ios_open(win, x=None, y=None, dy=18, ms=340, alpha=1.0):
+    """Spring up into place while fading in."""
+    try:
+        win.attributes("-alpha", 0.0)
+    except tk.TclError:
+        return
+
+    def frame(p):
+        if x is not None and dy:
+            win.geometry(f"+{x}+{round(y + dy * (1 - p))}")
+        win.attributes("-alpha", max(0.0, min(alpha, alpha * p * 1.4)))
+    animate(win, ms, frame, ease=ease_out_back)
+
+
+class IosWindow:
+    """Mixin for dialogs: spring/fade in when opened, fade out when closed."""
+
+    def center_open(self, top_frac=4):
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2
+        y = self.winfo_screenheight() // top_frac
+        self.geometry(f"+{x}+{y}")
+        ios_open(self, x, y)
+
+    def destroy(self):
+        if getattr(self, "_closing", False) or not ANIM["on"]:
+            return tk.Toplevel.destroy(self)
+        try:
+            if not self.winfo_viewable():
+                return tk.Toplevel.destroy(self)
+            self.grab_release()
+            a0 = float(self.attributes("-alpha"))
+        except tk.TclError:
+            return tk.Toplevel.destroy(self)
+        self._closing = True
+        animate(self, 170, lambda p: self.attributes("-alpha", max(0.0, a0 * (1 - p))),
+                done=lambda: tk.Toplevel.destroy(self), ease=ease_in_cubic)
+
+
+def light_images(px):
+    """Mac-style red / yellow / green dots, each as (normal, hover-with-symbol) PhotoImages."""
+    from PIL import Image, ImageDraw, ImageTk
+    S = 4
+    n = px * S
+    specs = [("#ff5f57", "#e0443e", "#4d0000", "x"), ("#febc2e", "#dea123", "#5a3a00", "-"),
+             ("#28c840", "#1aab29", "#003a00", "+")]
+    out = []
+    for fill, ring, ink, sym in specs:
+        pair = []
+        for hover in (False, True):
+            img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse([S // 2, S // 2, n - S // 2 - 1, n - S // 2 - 1], fill=fill, outline=ring, width=S)
+            if hover:
+                w, a, b = max(S, int(n * 0.1)), n * 0.3, n * 0.7
+                if sym == "x":
+                    d.line([a, a, b, b], fill=ink, width=w)
+                    d.line([a, b, b, a], fill=ink, width=w)
+                else:
+                    d.line([a, n / 2, b, n / 2], fill=ink, width=w)
+                    if sym == "+":
+                        d.line([n / 2, a, n / 2, b], fill=ink, width=w)
+            pair.append(ImageTk.PhotoImage(img.resize((px, px), Image.LANCZOS)))
+        out.append(tuple(pair))
+    return out
 
 
 def dark_titlebar(win):
@@ -1028,6 +1205,7 @@ class Tip:
                  justify="left", padx=8, pady=5, highlightthickness=1,
                  highlightbackground=C["border"]).pack()
         tw.geometry(f"+{self.w.winfo_rootx()}+{self.w.winfo_rooty() + self.w.winfo_height() + 4}")
+        round_window(tw, small=True)
         Tip.current = tw
 
     def hide(self, _e=None):
@@ -1062,6 +1240,10 @@ class Card(tk.Toplevel):
         self.body = tk.Frame(outer, bg=C["panel"], padx=int(14 * s), pady=int(12 * s))
         self.body.pack(fill="both", expand=True, padx=(int(6 * s), 0))
         self.wrap = int(300 * s)
+        self._placed = False     # restack_toasts slides it in the first time
+        if ANIM["on"]:
+            self.attributes("-alpha", 0.0)
+        round_window(self)
 
     def label(self, text, font, fg=None, pady=0):
         tk.Label(self.body, text=text, bg=C["panel"], fg=fg or C["fg"], font=font,
@@ -1077,11 +1259,24 @@ class Card(tk.Toplevel):
     def close(self):
         if self.app.toasts.get(self.key) is self:
             self.app.toasts.pop(self.key, None)
-        try:
-            self.destroy()
-        except tk.TclError:
-            pass
         self.app.restack_toasts()
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
+        def kill():
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
+        try:
+            x, y = self.winfo_x(), self.winfo_y()
+        except tk.TclError:
+            return
+        # slide out to the right while fading, like dismissing an iOS banner
+        animate(self, 220, lambda p: (self.geometry(f"+{round(x + 70 * p)}+{y}"),
+                                      self.attributes("-alpha", max(0.0, 1 - p))),
+                done=kill, ease=ease_in_cubic)
 
 
 class Toast(Card):
@@ -1201,7 +1396,7 @@ class Notice(Card):
 
 # ---------------------------------------------------------------- dialogs
 
-class ReminderDialog(tk.Toplevel):
+class ReminderDialog(IosWindow, tk.Toplevel):
     def __init__(self, app, r=None, day=None, prefill=None):
         super().__init__(app.root)
         self.app, self.r = app, r
@@ -1311,7 +1506,9 @@ class ReminderDialog(tk.Toplevel):
         dark_titlebar(self)
         self.update_idletasks()
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
-        self.geometry(f"+{(self.winfo_screenwidth() - w) // 2}+{(self.winfo_screenheight() - h) // 3}")
+        x, y = (self.winfo_screenwidth() - w) // 2, max(10, (self.winfo_screenheight() - h) // 3)
+        self.geometry(f"+{x}+{y}")
+        ios_open(self, x, y)
         self.e_title.focus_force()
         self.grab_set()
 
@@ -1390,7 +1587,7 @@ class ReminderDialog(tk.Toplevel):
         self.app.complete_with_undo(rid)
 
 
-class QuickAdd(tk.Toplevel):
+class QuickAdd(IosWindow, tk.Toplevel):
     EXAMPLES = ("apply for scholarship dec 1 5pm #college !   \u00b7   pay rent 1st every month #bills\n"
                 "call mom tomorrow 7pm   \u00b7   exam in 3 days remind 1 day before   \u00b7   gym every monday 6am\n"
                 "fill visa form next friday www.example.com/form   (! = important, a link becomes a button)")
@@ -1424,8 +1621,7 @@ class QuickAdd(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         dark_titlebar(self)
         self.update_idletasks()
-        w = self.winfo_reqwidth()
-        self.geometry(f"+{(self.winfo_screenwidth() - w) // 2}+{self.winfo_screenheight() // 4}")
+        self.center_open()
         self.after(40, self.grab_focus)
 
     def grab_focus(self):
@@ -1478,7 +1674,7 @@ class QuickAdd(tk.Toplevel):
         self.app.edit(None, prefill=p)
 
 
-class DayDialog(tk.Toplevel):
+class DayDialog(IosWindow, tk.Toplevel):
     def __init__(self, app, d, items):
         super().__init__(app.root)
         self.title(fmt_date(d))
@@ -1508,10 +1704,11 @@ class DayDialog(tk.Toplevel):
         if app.root.state() == "withdrawn":
             x, y = (self.winfo_screenwidth() - self.winfo_reqwidth()) // 2, self.winfo_screenheight() // 3
         self.geometry(f"+{x}+{y}")
+        ios_open(self, x, y)
         self.focus_force()
 
 
-class PhoneDialog(tk.Toplevel):
+class PhoneDialog(IosWindow, tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
@@ -1544,8 +1741,7 @@ class PhoneDialog(tk.Toplevel):
         mkbtn(row, "Turn off", self.off, bg=C["panel"], fg=C["danger"]).pack(side="left")
         self.bind("<Escape>", lambda ev: self.destroy())
         dark_titlebar(self)
-        self.update_idletasks()
-        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_reqwidth()) // 2}+{self.winfo_screenheight() // 4}")
+        self.center_open()
         self.focus_force()
 
     def topic(self):
@@ -1585,7 +1781,7 @@ def onedrive_folder():
     return os.path.join(od, "MiniFloatingCalendar") if od and os.path.isdir(od) else None
 
 
-class DataDialog(tk.Toplevel):
+class DataDialog(IosWindow, tk.Toplevel):
     """Choose where reminders are saved (e.g. OneDrive for backup / sharing between PCs)."""
 
     def __init__(self, app):
@@ -1625,8 +1821,7 @@ class DataDialog(tk.Toplevel):
         self.status.pack(fill="x", pady=(8, 0))
         self.bind("<Escape>", lambda e: self.destroy())
         dark_titlebar(self)
-        self.update_idletasks()
-        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_reqwidth()) // 2}+{self.winfo_screenheight() // 4}")
+        self.center_open()
         self.focus_force()
 
     def _use(self, folder):
@@ -1645,7 +1840,7 @@ class DataDialog(tk.Toplevel):
         os.startfile(p)
 
 
-class ThemeDialog(tk.Toplevel):
+class ThemeDialog(IosWindow, tk.Toplevel):
     """Pick the light theme, the dark theme, and when to switch between them."""
 
     def __init__(self, app):
@@ -1711,8 +1906,7 @@ class ThemeDialog(tk.Toplevel):
         self.bind("<Escape>", lambda ev: self.destroy())
         self._sync()
         dark_titlebar(self)
-        self.update_idletasks()
-        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_reqwidth()) // 2}+{self.winfo_screenheight() // 4}")
+        self.center_open()
         self.focus_force()
 
     def _preset(self, a, b):
@@ -1747,7 +1941,7 @@ class ThemeDialog(tk.Toplevel):
 
 # ---------------------------------------------------------------- big calendar window
 
-class BigCalendar(tk.Toplevel):
+class BigCalendar(IosWindow, tk.Toplevel):
     def __init__(self, app):
         super().__init__(app.root)
         self.app = app
@@ -1772,6 +1966,7 @@ class BigCalendar(tk.Toplevel):
         self.bind("<Right>", lambda e: self.mode == "month" and self.shift(1))
         dark_titlebar(self)
         self.refresh()
+        ios_open(self, dy=0, ms=260)
 
     def close(self):
         try:
@@ -2093,6 +2288,15 @@ class App:
         self.root = root
         self.lock = lock
         self.events = queue.Queue()
+        try:   # Windows 10 has no "Segoe UI Variable": fall back to Segoe UI
+            from tkinter import font as tkfont
+            families = set(tkfont.families(root))
+            for th in THEMES.values():
+                for k in ("F", "FH", "FM"):
+                    if th[k] not in families:
+                        th[k] = "Segoe UI" if k != "FM" else "Consolas"
+        except Exception:
+            pass
         self.store = Store()
         self.store.settings["theme"] = self.wanted_theme() or self.store.settings["theme"]
         C.clear()
@@ -2109,6 +2313,11 @@ class App:
         self.tray = None
         self.hotkey_ok = True
         self._drag = None
+        self._fwd = None            # widget receiving clicks forwarded from the glass catcher
+        self.glass = False
+        self.catcher = None
+        self._animating = False
+        self._lights = None
         today = date.today()
         self.vy, self.vm = today.year, today.month
         self.last_day = today
@@ -2135,15 +2344,212 @@ class App:
             self.tray = self.start_tray()
             threading.Thread(target=hotkey_loop, args=(self.events,), daemon=True).start()
         self.menu = self._build_menu()
+        self.make_drag(self.frame)   # empty areas drag the widget too
         self.render()
         self._place()
+        round_window(root)
+        self._setup_catcher()
+        self.apply_glass()
+        root.bind("<Configure>", lambda e: e.widget is root and self.sync_catcher(), add="+")
         if self.tray and self.store.settings.get("hidden"):
             root.withdraw()
+            self.sync_catcher()
+        else:
+            self.anim_show(already_visible=True)
         root.after(1500, self.tick)
         root.after(250, self.poll_events)
         root.after(600, self.blink)
         if background:
             root.after(20_000, self.update_loop)
+
+    # ---- frosted glass
+    def frame_color(self):
+        """Colour of the thin outer ring: invisible on glass, a border colour otherwise."""
+        return C["bg"] if self.glass else C["border"]
+
+    def apply_glass(self):
+        tint = C.get("glass")
+        ok = bool(tint) and set_acrylic(self.root, tint)
+        if ok:
+            self.root.attributes("-transparentcolor", C["bg"])
+        else:
+            if self.glass:
+                set_acrylic(self.root, 0)
+            try:
+                self.root.attributes("-transparentcolor", "")
+            except tk.TclError:
+                pass
+        self.glass = ok
+        self.root.configure(bg=self.frame_color())
+        self.sync_catcher()
+
+    def _setup_catcher(self):
+        """Glass areas let clicks fall through, so an invisible window sits underneath to catch
+        them and hand them back to the calendar."""
+        c = tk.Toplevel(self.root)
+        c.overrideredirect(True)
+        c.configure(bg="black")
+        c.attributes("-alpha", 0.01)
+        c.withdraw()
+        for seq in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<ButtonPress-3>"):
+            c.bind(seq, self._forward)
+        self.catcher = c
+        self._catcher_ready = False
+
+    def sync_catcher(self, restack=False):
+        """Keep the catcher exactly under the widget. Only touches it when something changed,
+        so it can't feed back into the widget's own <Configure> events."""
+        c = self.catcher
+        if c is None:
+            return
+        try:
+            if not self.glass or self.root.state() == "withdrawn":
+                if c.state() != "withdrawn":
+                    c.withdraw()
+                self._catcher_geom = None
+                return
+            geom = (f"{self.root.winfo_width()}x{self.root.winfo_height()}"
+                    f"+{self.root.winfo_x()}+{self.root.winfo_y()}")
+            fresh = c.state() == "withdrawn"
+            if fresh:
+                c.attributes("-topmost", self.store.settings["topmost"])
+                c.deiconify()
+                if not self._catcher_ready:
+                    set_noactivate(c)
+                    self._catcher_ready = True
+            if geom != getattr(self, "_catcher_geom", None):
+                c.geometry(geom)
+                self._catcher_geom = geom
+            if fresh or restack:
+                c.lift()
+                self.root.lift()
+        except tk.TclError:
+            pass
+
+    def widget_at(self, x, y):
+        def hit(w):
+            try:
+                if not w.winfo_ismapped():
+                    return None
+                wx, wy = w.winfo_rootx(), w.winfo_rooty()
+                if not (wx <= x < wx + w.winfo_width() and wy <= y < wy + w.winfo_height()):
+                    return None
+                kids = w.winfo_children()
+            except tk.TclError:
+                return None
+            for c in reversed(kids):
+                r = hit(c)
+                if r is not None:
+                    return r
+            return w
+        return hit(self.frame)
+
+    def _forward(self, e):
+        et = str(e.type)
+        if et in ("ButtonPress", "4"):
+            self._fwd = self.widget_at(e.x_root, e.y_root)
+            seq = "<Button-3>" if getattr(e, "num", 1) == 3 else "<ButtonPress-1>"
+        elif et in ("Motion", "6"):
+            seq = "<B1-Motion>"
+        else:
+            seq = "<ButtonRelease-1>"
+        target = self._fwd
+        if target is None:
+            return
+        try:
+            target.event_generate(seq, x=e.x_root - target.winfo_rootx(), y=e.y_root - target.winfo_rooty(),
+                                  rootx=e.x_root, rooty=e.y_root)
+        except tk.TclError:
+            pass
+        if seq != "<B1-Motion>" and seq != "<ButtonPress-1>":
+            self._fwd = None
+            self.sync_catcher(restack=True)
+
+    # ---- open / close motion
+    def anim_show(self, already_visible=False):
+        """Spring up from slightly below while fading in."""
+        root = self.root
+        target = float(self.store.settings.get("alpha", 1.0))
+        try:
+            if not already_visible:
+                root.attributes("-alpha", 0.0)
+                root.deiconify()
+            root.update_idletasks()
+            x, y = root.winfo_x(), root.winfo_y()
+        except tk.TclError:
+            return
+        self._animating = True
+
+        def frame(p):
+            root.geometry(f"+{x}+{round(y + 22 * (1 - p))}")
+            root.attributes("-alpha", max(0.0, min(target, target * p * 1.4)))
+
+        def done():
+            self._animating = False
+            self._cur_alpha = None
+            self.update_alpha()
+            self.sync_catcher()
+        animate(root, 380, frame, done=done, ease=ease_out_back)
+
+    def anim_hide(self, then):
+        """Sink and fade out, then run `then` (which withdraws the widget)."""
+        root = self.root
+        try:
+            x, y = root.winfo_x(), root.winfo_y()
+            a0 = float(root.attributes("-alpha"))
+        except tk.TclError:
+            return then()
+        self._animating = True
+        if self.catcher is not None:
+            self.catcher.withdraw()
+
+        def done():
+            then()
+            try:
+                root.geometry(f"+{x}+{y}")
+            except tk.TclError:
+                pass
+            self._animating = False
+            self._cur_alpha = None
+        animate(root, 200, lambda p: (root.geometry(f"+{x}+{round(y + 14 * p)}"),
+                                      root.attributes("-alpha", max(0.0, a0 * (1 - p)))),
+                done=done, ease=ease_in_cubic)
+
+    def get_lights(self):
+        px = max(10, int(12 * self.s))
+        if self._lights is None or self._lights[0] != px:
+            try:
+                self._lights = (px, light_images(px))
+            except Exception:
+                self._lights = (px, None)
+        return self._lights[1]
+
+    def _traffic_lights(self, parent):
+        """Red = hide, yellow = collapse, green = big calendar. Symbols appear on hover, like a Mac."""
+        box = tk.Frame(parent, bg=C["bg"])
+        imgs = self.get_lights()
+        acts = [(self.hide_widget, "Hide to tray" if self.tray else "Collapse"),
+                (self.toggle_collapse, "Collapse"), (self.open_big, "Big calendar")]
+        dots = []
+        for i, (cmd, tip) in enumerate(acts):
+            if imgs:
+                d = tk.Label(box, image=imgs[i][0], bg=C["bg"], bd=0, cursor="hand2")
+            else:   # no Pillow: plain coloured circles
+                d = tk.Canvas(box, width=12, height=12, bg=C["bg"], highlightthickness=0, cursor="hand2")
+                d.create_oval(1, 1, 11, 11, fill=("#ff5f57", "#febc2e", "#28c840")[i], width=0)
+            d.pack(side="left", padx=(0 if i == 0 else 4, 0))
+            d.bind("<Button-1>", lambda e, c=cmd: c())
+            Tip(d, tip)
+            dots.append(d)
+
+        def hover(on):
+            if imgs:
+                for i, d in enumerate(dots):
+                    d.config(image=imgs[i][1 if on else 0])
+        for w in [box] + dots:
+            w.bind("<Enter>", lambda e: hover(True), add="+")
+            w.bind("<Leave>", lambda e: hover(False), add="+")
+        return box
 
     # ---- setup
     def _style(self):
@@ -2254,6 +2660,8 @@ class App:
 
     def update_alpha(self):
         """Translucent normally; solid while hovered or while a reminder is waiting."""
+        if self._animating:
+            return
         st = self.store.settings
         a = float(st.get("alpha", 1.0))
         if a < 1.0:
@@ -2332,8 +2740,10 @@ class App:
                 self.toggle_collapse()
             return
         Tip.close()
-        self.root.withdraw()
+        if self.root.state() == "withdrawn" or self._animating:
+            return
         self._set("hidden", True)
+        self.anim_hide(self.root.withdraw)
         if not self.store.settings.get("tray_hint_shown"):
             self._set("tray_hint_shown", True)
             Notice(self, "__trayhint__", "Still running",
@@ -2345,9 +2755,10 @@ class App:
     def show(self):
         if self.store.settings["collapsed"]:
             self.toggle_collapse()
-        self.root.deiconify()
-        self.root.lift()
         self._set("hidden", False)
+        if self.root.state() == "withdrawn":
+            self.anim_show()
+        self.root.lift()
 
     def toggle_widget(self):
         if self.root.state() == "withdrawn":
@@ -2498,31 +2909,25 @@ class App:
     def _render_full(self):
         today = date.today()
         now = datetime.now()
-        hdr = tk.Frame(self.frame, bg=C["bg"], padx=6, pady=6)
+        hdr = tk.Frame(self.frame, bg=C["bg"], padx=10, pady=8)
         hdr.pack(fill="x")
         hb = dict(bg=C["bg"], font=f(11), padx=5, pady=0)
+        self._traffic_lights(hdr).pack(side="left", padx=(0, 10))
         mkbtn(hdr, "\u2039", lambda: self.shift(-1), **hb).pack(side="left")
         title = tk.Label(hdr, text=heading(f"{calendar.month_abbr[self.vm]} {self.vy}", spaced=False),
                          bg=C["bg"], fg=C["fg"], font=fh(11), cursor="fleur")
         title.pack(side="left")
         mkbtn(hdr, "\u203a", lambda: self.shift(1), **hb).pack(side="left")
-        close = mkbtn(hdr, "\u00d7", self.hide_widget, **hb)
-        close.pack(side="right")
-        Tip(close, "Hide to tray" if self.tray else "Collapse")
-        mkbtn(hdr, "\u2013", self.toggle_collapse, **hb).pack(side="right")
         mkbtn(hdr, "\u22ef", lambda: self.menu.tk_popup(self.root.winfo_pointerx(),
                                                         self.root.winfo_pointery()), **hb).pack(side="right")
-        big = mkbtn(hdr, "\u25a6", self.open_big, **hb)
-        big.pack(side="right")
-        Tip(big, "Big calendar")
-        add = mkbtn(hdr, "+", self.quick_add, **hb)
+        add = mkbtn(hdr, "+", self.quick_add, bg=C["bg"], fg=C["accent"], font=f(13, "bold"), padx=5, pady=0)
         add.pack(side="right")
         Tip(add, f"Quick add ({HOTKEY_LABEL})")
         self.make_drag(hdr)
         self.make_drag(title, on_click=self.goto_today)
 
         tk.Frame(self.frame, bg=C["border"], height=1).pack(fill="x", padx=10)
-        if not C["dark"]:  # double rule: a little printed-almanac flourish
+        if C.get("double_rule"):  # a little printed-almanac flourish
             tk.Frame(self.frame, bg=C["border"], height=1).pack(fill="x", padx=10, pady=(2, 0))
 
         grid = tk.Frame(self.frame, bg=C["bg"], padx=8, pady=4)
@@ -2621,7 +3026,7 @@ class App:
 
     def quick_add(self):
         Tip.close()
-        if self.qa is not None:
+        if self.qa is not None and not getattr(self.qa, "_closing", False):
             try:
                 if self.qa.winfo_exists():
                     self.qa.grab_focus()
@@ -2631,6 +3036,8 @@ class App:
         self.qa = QuickAdd(self)
 
     def open_big(self):
+        if self.big is not None and getattr(self.big, "_closing", False):
+            self.big = None
         if self.big is not None:
             try:
                 self.big.deiconify()
@@ -2688,8 +3095,8 @@ class App:
     def rebuild_ui(self):
         """Redraw every window after a theme or size change."""
         self._style()
-        self.root.configure(bg=C["border"])
         self.frame.configure(bg=C["bg"])
+        self.apply_glass()
         for w in (self.dialog, self.qa):
             try:
                 if w is not None:
@@ -2872,6 +3279,7 @@ class App:
             self.shutdown()
 
     def shutdown(self):
+        ANIM["on"] = False   # close everything immediately
         if self.tray:
             try:
                 self.tray.stop()
@@ -2897,8 +3305,28 @@ class App:
             except tk.TclError:
                 continue
             y -= h
-            toast.geometry(f"{w}x{h}+{r - w - gap}+{max(t, y)}")
+            tx, ty = r - w - gap, max(t, y)
             y -= int(8 * self.s)
+            if not toast._placed:
+                # new card: glide in from the right with a little spring, fading in
+                toast._placed = True
+                sx = tx + int(w * 0.6)
+                toast.geometry(f"{w}x{h}+{sx}+{ty}")
+                animate(toast, 460, lambda p, tw=toast, sx=sx, tx=tx, ty=ty, w=w, h=h: (
+                    tw.geometry(f"{w}x{h}+{round(sx + (tx - sx) * p)}+{ty}"),
+                    tw.attributes("-alpha", max(0.0, min(1.0, p * 1.5)))), ease=ease_out_back)
+            else:
+                try:
+                    cx, cy = toast.winfo_x(), toast.winfo_y()
+                except tk.TclError:
+                    continue
+                if (cx, cy) == (tx, ty):
+                    toast.geometry(f"{w}x{h}+{tx}+{ty}")
+                    continue
+                # others slide smoothly into their new slot
+                animate(toast, 240, lambda p, tw=toast, cx=cx, cy=cy, tx=tx, ty=ty, w=w, h=h: (
+                    tw.geometry(f"{w}x{h}+{round(cx + (tx - cx) * p)}+{round(cy + (ty - cy) * p)}"),
+                    tw.attributes("-alpha", 1.0)))
 
     def blink(self):
         """While a reminder pop-up is waiting, flash the widget border, the card edge and the tray icon."""
@@ -2918,7 +3346,7 @@ class App:
                     self.nag(waiting, now)
             elif self._alerting:
                 self._blink_on = False
-                self.root.configure(bg=C["border"])
+                self.root.configure(bg=self.frame_color())
                 if self.tray:
                     self.tray.icon = self._tray_img(alert=False)
             self._alerting = bool(waiting)

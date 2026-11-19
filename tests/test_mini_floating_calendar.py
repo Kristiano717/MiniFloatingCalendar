@@ -119,6 +119,7 @@ class AppTests(unittest.TestCase):
         mfc.DATA_DIR = self.dir
         mfc.SET_FILE = os.path.join(self.dir, "settings.json")
         mfc.LOG_FILE = os.path.join(self.dir, "error.log")
+        mfc.ANIM["on"] = False          # instant open/close so tests are deterministic
         self.root = tk.Tk()
         self.app = mfc.App(self.root, None, background=False)
         st = self.app.store.settings
@@ -225,6 +226,71 @@ class AppTests(unittest.TestCase):
         self.assertEqual([i["text"] for i in r["checklist"]], ["Transcript", "SOP"])
         self.assertEqual(r["link"], "https://example.com/apply")
         self.assertTrue(r["important"])
+
+    def test_animations_open_and_close(self):
+        mfc.ANIM["on"] = True
+        try:
+            self.app.quick_add()
+            qa = self.app.qa
+            self.pump(600)
+            self.assertAlmostEqual(float(qa.attributes("-alpha")), 1.0, places=2)
+            qa.destroy()                       # fades out, then really closes
+            self.assertTrue(qa.winfo_exists())
+            self.pump(400)
+            self.assertFalse(qa.winfo_exists())
+            # pop-up glides in from the right and ends in its slot
+            self.add("now", time=(datetime.now() - timedelta(minutes=1)).strftime("%H:%M"))
+            self.app.check_reminders()
+            card = self.app.toasts["now"]
+            self.pump(700)
+            l, t, r, b = mfc.work_area(self.root)
+            self.assertLess(abs(card.winfo_x() + card.winfo_width() - (r - int(12 * self.app.s))), 4)
+            card.close()
+            self.pump(400)
+            self.assertFalse(card.winfo_exists())
+            # hide to tray / show again (tray isn't running in tests, so pretend)
+            self.app.tray = object()
+            self.app.store.settings["tray_hint_shown"] = True
+            self.app.hide_widget()
+            self.pump(400)
+            self.assertEqual(self.root.state(), "withdrawn")
+            self.app.show()
+            self.pump(600)
+            self.assertEqual(self.root.state(), "normal")
+            self.app.tray = None
+        finally:
+            mfc.ANIM["on"] = False
+
+    def test_glass_theme_and_click_forwarding(self):
+        self.app.apply_theme("iOS Light")
+        self.pump(200)
+        if not self.app.glass:
+            self.skipTest("acrylic glass not available on this Windows")
+        self.assertEqual(self.root.attributes("-transparentcolor"), mfc.C["bg"])
+        self.assertEqual(self.app.catcher.state(), "normal")
+        # a click that lands on the glass between letters reaches the day underneath
+        opened = []
+        self.app.open_day = lambda d: opened.append(d)
+        self.app.render()
+        self.pump()
+        def walk(w):
+            yield w
+            for c in w.winfo_children():
+                yield from walk(c)
+        cell = next(w for w in walk(self.app.frame)
+                    if isinstance(w, tk.Label) and w.cget("text") == "15")
+        x, y = cell.winfo_rootx() + 2, cell.winfo_rooty() + 2
+
+        class Ev:   # what the catcher would receive
+            def __init__(s, t):
+                s.type, s.num, s.x_root, s.y_root = t, 1, x, y
+        self.app._forward(Ev("ButtonPress"))
+        self.app._forward(Ev("ButtonRelease"))
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].day, 15)
+        self.app.apply_theme("Daylight")
+        self.assertFalse(self.app.glass)
+        self.assertEqual(self.app.catcher.state(), "withdrawn")
 
     def test_data_folder_sync_and_backup(self):
         self.add("a")

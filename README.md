@@ -46,8 +46,14 @@ Categories: `#personal #work #college #bills #health #other`.
 - The `×` button hides the widget to the system tray, including the `^` hidden-icons area. Click the tray icon to bring it back, or right-click it for a menu.
 - Starts with Windows. It only quits if you choose **Quit**.
 
+**iOS-style look**
+- **Frosted glass**: in the iOS Light / iOS Dark themes the widget blurs whatever is behind it. This needs Windows 10 or 11.
+- **Mac-style window dots**: 🔴 hide to tray, 🟡 collapse, 🟢 big calendar. Their symbols appear when you hover over them.
+- **Spring animations**: the widget and dialogs spring up and fade in when they open, then sink and fade when they close. Reminder cards glide in from the right and slide away when dismissed.
+- Rounded corners and soft shadows on Windows 11.
+
 **Themes** (right-click → Theme)
-- Light: **Vintage Almanac** (default), **Daylight**. Dark: **Midnight Noir**, **Retro Terminal**, **Synthwave '84**.
+- Light: **iOS Light** (default, glass), **Vintage Almanac**, **Daylight**. Dark: **iOS Dark** (default at night, glass), **Midnight Noir**, **Retro Terminal**, **Synthwave '84**.
 - **Automatic light/dark**: a light theme during the day and a dark one at night (7 AM / 7 PM by default), or follow Windows' own light/dark setting. Set the themes and times under **Theme → Light / dark timings…**. Picking a theme by hand turns automatic switching off.
 
 **Other features**
