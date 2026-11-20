@@ -224,6 +224,36 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.wanted_theme(datetime(2026, 1, 1, 8)), "Vintage Almanac")
         self.assertEqual(self.app.wanted_theme(datetime(2026, 1, 1, 22)), "Midnight Noir")
 
+    def test_drag_resize_grip(self):
+        from types import SimpleNamespace as E
+        app = self.app
+        self.pump()
+        self.assertTrue(app.grip.winfo_ismapped())
+        w0, s0 = self.root.winfo_width(), mfc.UI["scale"]
+        app._grip_press(E(x_root=500, y_root=500))
+        for step in range(1, 6):             # drag the corner out diagonally, re-rendering live
+            app._grip_motion(E(x_root=500 + 20 * step, y_root=500 + 20 * step))
+            self.pump()
+        self.assertGreater(mfc.UI["scale"], s0)
+        self.assertTrue(app.grip.winfo_exists())   # survived the live re-renders
+        app._grip_release()
+        self.pump()
+        self.assertGreater(self.root.winfo_width(), w0)
+        self.assertEqual(app.store.settings["size"], mfc.UI["scale"])
+        # shrink below the minimum clamps
+        app._grip_press(E(x_root=500, y_root=500))
+        app._grip_motion(E(x_root=-3000, y_root=-3000))
+        app._grip_release()
+        self.assertEqual(mfc.UI["scale"], app.SIZE_MIN)
+        # Ctrl+scroll grows one step
+        app._wheel_resize(E(delta=120))
+        self.assertAlmostEqual(mfc.UI["scale"], app.SIZE_MIN + 0.05)
+        # collapsed mode hides the grip
+        app.toggle_collapse()
+        self.pump()
+        self.assertFalse(app.grip.winfo_ismapped())
+        app.set_size(1.0)
+
     def test_reminder_dialog_checklist_link(self):
         self.app.edit(None, date.today() + timedelta(days=3))
         d = self.app.dialog

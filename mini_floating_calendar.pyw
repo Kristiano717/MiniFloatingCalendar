@@ -50,7 +50,7 @@ LOCK_PORT = 47613
 NO_WINDOW = 0x08000000
 HOTKEY_LABEL = "Ctrl+Alt+R"
 NTFY_SERVER = "https://ntfy.sh"
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 NAG_SECONDS = 300   # ignored pop-ups shake and jump to the front again this often
 
 # ---------------------------------------------------------------- themes
@@ -2338,6 +2338,15 @@ class App:
         self.update_alpha()
         self.frame = tk.Frame(root, bg=C["bg"])
         self.frame.pack(fill="both", expand=True, padx=2, pady=2)
+        # Resize grip: lives on the root (not in self.frame) so it survives re-renders mid-drag.
+        self._resize = None
+        self.grip = tk.Label(root, text="◢", bg=C["bg"], fg=C["faint"], font=f(8),
+                             cursor="size_nw_se", bd=0, padx=0, pady=0)
+        self.grip.bind("<ButtonPress-1>", self._grip_press)
+        self.grip.bind("<B1-Motion>", self._grip_motion)
+        self.grip.bind("<ButtonRelease-1>", self._grip_release)
+        Tip(self.grip, "Drag to resize  ·  or Ctrl + scroll")
+        root.bind("<Control-MouseWheel>", self._wheel_resize)
         self._blink_on = False
         self._alerting = False
         if background:
@@ -2393,6 +2402,7 @@ class App:
         c.withdraw()
         for seq in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>", "<ButtonPress-3>"):
             c.bind(seq, self._forward)
+        c.bind("<Control-MouseWheel>", self._wheel_resize)
         self.catcher = c
         self._catcher_ready = False
 
@@ -2442,6 +2452,9 @@ class App:
                 if r is not None:
                     return r
             return w
+        g = getattr(self, "grip", None)
+        if g is not None and hit(g) is not None:
+            return g
         return hit(self.frame)
 
     def _forward(self, e):
@@ -2631,6 +2644,8 @@ class App:
         for v, lbl in ((0.85, "Small"), (1.0, "Normal"), (1.2, "Large"), (1.4, "Extra large")):
             sz.add_radiobutton(label=lbl, variable=self.v_size, value=v,
                                command=lambda: self.set_size(self.v_size.get()))
+        sz.add_separator()
+        sz.add_command(label="Any size: drag the ◢ corner or Ctrl + scroll", state="disabled")
         m.add_cascade(label="Size", menu=sz)
         self.v_allday = tk.StringVar(value=st["allday_time"])
         ad = tk.Menu(m, tearoff=0)
@@ -2853,8 +2868,12 @@ class App:
             w.destroy()
         if self.store.settings["collapsed"]:
             self._render_collapsed()
+            self.grip.place_forget()
         else:
             self._render_full()
+            self.grip.configure(bg=C["bg"], fg=C["faint"], font=f(8))
+            self.grip.place(relx=1.0, rely=1.0, anchor="se", x=-3, y=-2)
+            self.grip.lift()
         self.bind_menu(self.frame)
         self.last_render_min = datetime.now().minute
         self.update_tray_title()
@@ -3154,6 +3173,64 @@ class App:
         UI["scale"] = v
         self.s = self.root.winfo_fpixels("1i") / 96.0 * v
         self.rebuild_ui()
+        self.keep_on_screen()
+
+    # ---- free resizing (corner grip / Ctrl+scroll)
+    SIZE_MIN, SIZE_MAX = 0.7, 2.2
+
+    def _grip_press(self, e):
+        Tip.close()
+        self._resize = (e.x_root, e.y_root, max(1, self.root.winfo_width()), UI["scale"])
+
+    def _grip_motion(self, e):
+        if not self._resize:
+            return
+        sx, sy, w0, s0 = self._resize
+        d = ((e.x_root - sx) + (e.y_root - sy)) / 2      # diagonal pull
+        self.resize_to(s0 * (w0 + d) / w0, live=True)
+
+    def _grip_release(self, _e=None):
+        if self._resize is None:
+            return
+        self._resize = None
+        self.resize_to(UI["scale"])
+
+    def _wheel_resize(self, e):
+        self.resize_to(UI["scale"] + (0.05 if e.delta > 0 else -0.05))
+        return "break"
+
+    def resize_to(self, v, live=False):
+        """Scale the whole widget smoothly. `live` = still dragging, so don't save yet."""
+        v = round(max(self.SIZE_MIN, min(self.SIZE_MAX, round(v / 0.05) * 0.05)), 2)
+        if v != round(UI["scale"], 2):
+            UI["scale"] = v
+            self.s = self.root.winfo_fpixels("1i") / 96.0 * v
+            self.render()
+        if not live:
+            self.store.settings["size"] = v
+            self.store.save_settings()
+            self._style()
+            try:
+                self.v_size.set(v)
+            except (AttributeError, tk.TclError):
+                pass
+            self.keep_on_screen()
+
+    def keep_on_screen(self):
+        """After growing, nudge the widget back inside the screen's work area."""
+        try:
+            self.root.update_idletasks()
+            l, t, r, b = work_area(self.root)
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+        except tk.TclError:
+            return
+        x = max(l, min(x0, r - w))
+        y = max(t, min(y0, b - h))
+        if (x, y) != (x0, y0):
+            self.root.geometry(f"+{x}+{y}")
+            self.store.settings["x"], self.store.settings["y"] = x, y
+            self.store.save_settings()
 
     def with_undo(self, head, text, action):
         """Run a change, save it, and offer an Undo card for 8 seconds."""
