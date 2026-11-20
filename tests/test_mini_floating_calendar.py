@@ -224,35 +224,124 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.wanted_theme(datetime(2026, 1, 1, 8)), "Vintage Almanac")
         self.assertEqual(self.app.wanted_theme(datetime(2026, 1, 1, 22)), "Midnight Noir")
 
+    def _at(self, key):
+        """Canvas coordinates of the middle of an area on the widget, e.g. ("day", 15) or "grip"."""
+        z = self.app.zone(key)
+        self.assertIsNotNone(z, key)
+        x0, y0, x1, y1 = z["bbox"]
+        return (x0 + x1) / 2, (y0 + y1) / 2
+
     def test_drag_resize_grip(self):
         from types import SimpleNamespace as E
-        app = self.app
+        app, cv = self.app, self.app.cv
         self.pump()
-        self.assertTrue(app.grip.winfo_ismapped())
-        w0, s0 = self.root.winfo_width(), mfc.UI["scale"]
-        app._grip_press(E(x_root=500, y_root=500))
-        for step in range(1, 6):             # drag the corner out diagonally, re-rendering live
-            app._grip_motion(E(x_root=500 + 20 * step, y_root=500 + 20 * step))
+        day = app.zone(("day", 15))
+        self.assertIn(cv.gettags(day["item"])[0], app.live_fonts.tags.values())   # styled by font tag
+        items = cv.find_all()
+        w0, s0, cw0 = self.root.winfo_width(), mfc.UI["scale"], day["bbox"][2] - day["bbox"][0]
+        tw0 = cv.bbox(day["item"])[2] - cv.bbox(day["item"])[0]     # drawn width of the "15"
+        gx, gy = self._at("grip")
+        app._cv_press(E(x=gx, y=gy, x_root=500, y_root=500))      # grab the corner grip
+        self.assertIsNotNone(app._resize)
+        for step in range(1, 6):             # drag it out diagonally
+            app._cv_drag(E(x=gx, y=gy, x_root=500 + 20 * step, y_root=500 + 20 * step))
             self.pump()
         self.assertGreater(mfc.UI["scale"], s0)
-        self.assertTrue(app.grip.winfo_exists())   # survived the live re-renders
-        app._grip_release()
+        self.assertEqual(cv.find_all(), items)              # resized in place, nothing redrawn
+        day = app.zone(("day", 15))
+        self.assertGreater(day["bbox"][2] - day["bbox"][0], cw0)
+        self.assertGreater(cv.bbox(day["item"])[2] - cv.bbox(day["item"])[0], tw0)   # text drawn bigger
+        self.assertEqual(app.store.settings["size"], s0)    # not saved until the grip is let go
+        app.changed()                                       # a redraw asked for mid-drag waits
+        self.assertTrue(app._render_pending)
+        self.assertEqual(cv.find_all(), items)
+        app._cv_release(E(x=gx, y=gy, x_root=600, y_root=600))
         self.pump()
+        self.assertIsNone(app._resize)
+        self.assertFalse(app._render_pending)
         self.assertGreater(self.root.winfo_width(), w0)
-        self.assertEqual(app.store.settings["size"], mfc.UI["scale"])
+        self.assertEqual(app.store.settings["size"], round(mfc.UI["scale"], 3))
         # shrink below the minimum clamps
         app._grip_press(E(x_root=500, y_root=500))
         app._grip_motion(E(x_root=-3000, y_root=-3000))
         app._grip_release()
         self.assertEqual(mfc.UI["scale"], app.SIZE_MIN)
-        # Ctrl+scroll grows one step
+        # Ctrl+scroll: one notch grows 5 %, a touchpad's small delta grows a little
         app._wheel_resize(E(delta=120))
-        self.assertAlmostEqual(mfc.UI["scale"], app.SIZE_MIN + 0.05)
-        # collapsed mode hides the grip
+        self.assertAlmostEqual(mfc.UI["scale"], app.SIZE_MIN + 0.05, places=3)
+        app._wheel_resize(E(delta=24))
+        self.assertAlmostEqual(mfc.UI["scale"], app.SIZE_MIN + 0.06, places=3)
+        # collapsed mode has no grip
         app.toggle_collapse()
         self.pump()
-        self.assertFalse(app.grip.winfo_ismapped())
+        self.assertIsNone(app.zone("grip"))
         app.set_size(1.0)
+
+    def test_resize_glides_smoothly(self):
+        mfc.ANIM["on"] = True
+        self.addCleanup(mfc.ANIM.__setitem__, "on", False)
+        app = self.app
+        self.pump()
+        items = app.cv.find_all()
+        frames = []
+        real = app.apply_scale
+        app.apply_scale = lambda v: (frames.append(v), real(v))
+        app.set_size(1.5)                    # Size menu preset
+        self.wait_until(lambda: app.store.settings["size"] == 1.5)
+        self.assertGreater(len(frames), 4)            # several in-between frames, not one jump
+        self.assertEqual(frames, sorted(frames))      # grows steadily, no overshoot or wobble
+        self.assertAlmostEqual(mfc.UI["scale"], 1.5)
+        self.assertEqual(app.cv.find_all(), items)    # same canvas items, just moved and resized
+        light = app.zone(("light", 0))
+        self.assertGreaterEqual(light["bbox"][2] - light["bbox"][0], app.light_px())
+
+    def test_canvas_clicks_hover_and_drag(self):
+        from types import SimpleNamespace as E
+        app = self.app
+        self.pump()
+        opened = []
+        app.open_day = lambda d: opened.append(d)
+
+        def click(key):
+            x, y = self._at(key)
+            app._cv_press(E(x=x, y=y, x_root=400, y_root=400))
+            app._cv_release(E(x=x, y=y, x_root=400, y_root=400))
+        click(("day", 15))
+        self.assertEqual([d.day for d in opened], [15])
+        month = (app.vy, app.vm)
+        click("next")
+        self.assertNotEqual((app.vy, app.vm), month)
+        click("title")                       # back to this month
+        self.assertEqual((app.vy, app.vm), (date.today().year, date.today().month))
+        # hover: a plain day lights up and goes back; the traffic lights show symbols together
+        plain = 16 if date.today().day == 15 else 15
+        x, y = self._at(("day", plain))
+        hover = app._v["hover_cell"]
+        app._cv_motion(E(x=x, y=y))
+        self.assertEqual(app.cv.itemcget(hover, "state"), "normal")
+        hx0, hy0, hx1, hy1 = app.cv.coords(hover)
+        self.assertTrue(hx0 < x < hx1 and hy0 < y < hy1)       # the highlight sits on that day
+        app._cv_motion(E(x=1, y=1))          # empty corner
+        self.assertEqual(app.cv.itemcget(hover, "state"), "hidden")
+        app._cv_motion(E(x=self._at(("light", 2))[0], y=self._at(("light", 2))[1]))
+        self.assertTrue(app._lights_hover)
+        app._set_hover(None)
+        self.assertFalse(app._lights_hover)
+        # dragging from anywhere moves the widget instead of clicking
+        self.pump()
+        x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+        app._cv_press(E(x=x, y=y, x_root=400, y_root=400))
+        app._cv_drag(E(x=x, y=y, x_root=430, y_root=420))
+        app._cv_release(E(x=x, y=y, x_root=430, y_root=420))
+        self.pump()
+        self.assertEqual((self.root.winfo_x(), self.root.winfo_y()), (x0 + 30, y0 + 20))
+        self.assertEqual(app.store.settings["x"], x0 + 30)
+        self.assertEqual(len(opened), 1)     # still just the first click
+        # yellow light collapses; clicking the collapsed bar expands it again
+        click(("light", 1))
+        self.assertTrue(app.store.settings["collapsed"])
+        click("collapsed")
+        self.assertFalse(app.store.settings["collapsed"])
 
     def test_reminder_dialog_checklist_link(self):
         self.app.edit(None, date.today() + timedelta(days=3))
@@ -314,13 +403,8 @@ class AppTests(unittest.TestCase):
         self.app.open_day = lambda d: opened.append(d)
         self.app.render()
         self.pump()
-        def walk(w):
-            yield w
-            for c in w.winfo_children():
-                yield from walk(c)
-        cell = next(w for w in walk(self.app.frame)
-                    if isinstance(w, tk.Label) and w.cget("text") == "15")
-        x, y = cell.winfo_rootx() + 2, cell.winfo_rooty() + 2
+        cv, z = self.app.cv, self.app.zone(("day", 15))
+        x, y = round(cv.winfo_rootx() + z["bbox"][0] + 2), round(cv.winfo_rooty() + z["bbox"][1] + 2)
 
         class Ev:   # what the catcher would receive
             def __init__(s, t):

@@ -40,7 +40,7 @@ Categories: `#personal #work #college #bills #health #other`.
 - **Agenda view**: what's overdue, then the next 14 days, day by day.
 - **List view**: every reminder in one table. Search it, filter by Upcoming / Done / All, mark as done, restore, or delete.
 - **Translucent**: the widget is see-through when the mouse isn't on it and turns solid when you hover or a reminder is waiting. Set it under right-click → Translucency.
-- **Size**: drag the `◢` corner (bottom-right) to any size, or hold Ctrl and scroll over the widget. Presets Small / Normal / Large / Extra large are in the ⋯ menu. It remembers the size and stays on screen.
+- **Size**: drag the `◢` corner (bottom-right) to any size, or hold Ctrl and scroll over the widget. Presets Small / Normal / Large / Extra large are in the ⋯ menu. Resizing glides smoothly (the widget is drawn on a single canvas, so it zooms in place at ~55 fps instead of being rebuilt), remembers the size and stays on screen. You can also drag the widget from anywhere on it.
 
 **Lives in the tray**
 - The `×` button hides the widget to the system tray, including the `^` hidden-icons area. Click the tray icon to bring it back, or right-click it for a menu.

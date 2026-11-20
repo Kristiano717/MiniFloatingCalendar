@@ -26,7 +26,7 @@ import uuid
 import webbrowser
 from ctypes import wintypes
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 from datetime import date, datetime, timedelta, timezone
 
 try:
@@ -50,7 +50,7 @@ LOCK_PORT = 47613
 NO_WINDOW = 0x08000000
 HOTKEY_LABEL = "Ctrl+Alt+R"
 NTFY_SERVER = "https://ntfy.sh"
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 NAG_SECONDS = 300   # ignored pop-ups shake and jump to the front again this often
 
 # ---------------------------------------------------------------- themes
@@ -111,23 +111,116 @@ DEFAULT_THEME = "iOS Light"
 C = dict(THEMES[DEFAULT_THEME])   # current theme; replaced in place when the theme changes
 
 
-UI = {"scale": 1.0}   # text-size multiplier, set from the Size menu
+UI = {"scale": 1.0,   # text-size multiplier (Size menu / resize grip)
+      "live": None}   # a LiveFonts while the floating widget is being drawn
 
 
 def _sz(size):
     return max(6, round(size * UI["scale"]))
 
 
+class LiveFonts:
+    """Fonts for the floating widget, sized in pixels from the current scale.
+
+    Canvas text gets a plain font description plus one tag per font, so a resize is a single
+    itemconfigure per font. The named fonts here are only used to measure text: nothing
+    displays them, so resizing them doesn't make Tk re-measure every item for every font."""
+
+    def __init__(self, root):
+        self.root = root
+        self.ppt = root.winfo_fpixels("1p")      # screen pixels per point (follows Windows DPI)
+        self.fonts, self.px, self.keys, self.tags = {}, {}, {}, {}
+        self._widths, self._heights = {}, {}    # measurements per (font, pixel size)
+        # Tk frees a font the moment nothing uses it, so dragging back and forth would keep
+        # re-creating the same sizes. An invisible canvas holds on to every size once used.
+        self._keeper, self._kept = tk.Canvas(root), set()
+        self.active = set()                      # fonts the current view uses
+
+    def begin(self):
+        """A redraw starts: only fonts it uses need resizing from now on."""
+        self.active = set()
+
+    def measure(self, font, text):
+        key = self.keys[str(font)]
+        ck = (key, self.px[key], text)
+        w = self._widths.get(ck)
+        if w is None:
+            if len(self._widths) > 20000:
+                self._widths.clear()
+            w = self._widths[ck] = font.measure(text)
+        return w
+
+    def linespace(self, font):
+        key = self.keys[str(font)]
+        ck = (key, self.px[key])
+        h = self._heights.get(ck)
+        if h is None:
+            h = self._heights[ck] = font.metrics("linespace")
+        return h
+
+    def _px(self, size):
+        return max(8, round(size * UI["scale"] * self.ppt))
+
+    def get(self, family, size, style):
+        key = (family, size, style)
+        font, px = self.fonts.get(key), self._px(size)
+        if font is None:
+            self.px[key] = px
+            font = tkfont.Font(root=self.root, family=family, size=-px,
+                               weight="bold" if "bold" in style else "normal",
+                               overstrike="overstrike" in style)
+            self.fonts[key] = font
+            self.keys[str(font)] = key
+            self.tags[key] = f"font{len(self.tags)}"
+        elif self.px[key] != px:                 # unused since the size last changed
+            self.px[key] = px
+            font.configure(size=-px)
+        self.active.add(key)
+        return font
+
+    def key_of(self, font):
+        return self.keys[str(font)]
+
+    def desc(self, key):
+        """The same font as a plain description (not tied to the named font)."""
+        family, _size, style = key
+        d = (family, -self.px[key], "bold" if "bold" in style else "normal")
+        if "overstrike" in style:
+            d += ("overstrike",)
+        if d not in self._kept:
+            self._kept.add(d)
+            self._keeper.create_text(0, 0, text="", font=d)
+        return d
+
+    def rescale(self):
+        """Resize the current view's fonts for the current scale. Returns the keys that changed."""
+        changed = []
+        for key in self.active:
+            px = self._px(key[1])
+            if px != self.px[key]:
+                self.px[key] = px
+                self.fonts[key].configure(size=-px)
+                changed.append(key)
+        return changed
+
+
+def _font(family, size, style):
+    live = UI["live"]
+    if live is not None:
+        return live.get(family, size, style)
+    return (family, _sz(size), *style)
+
+
 def f(size, *style):
-    return (C["F"], _sz(size), *style)
+    return _font(C["F"], size, style)
 
 
 def fh(size, *style):
-    return (C["FH"], _sz(size), "bold", *style)
+    return _font(C["FH"], size, ("bold",) + style)
 
 
 def fm(size, *style):
-    return (C["FM"], _sz(size), *style)
+    return _font(C["FM"], size, style)
 
 
 def heading(text, spaced=True):
@@ -366,6 +459,23 @@ def work_area(root):
     except Exception:
         pass
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def monitor_work_area(win):
+    """Work area (screen minus taskbar) of the monitor this window is on."""
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromWindow.restype = wintypes.HANDLE
+        hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
+        mon = u.MonitorFromWindow(wintypes.HWND(hwnd), 2)     # nearest monitor
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if mon and u.GetMonitorInfoW(wintypes.HANDLE(mon), ctypes.byref(mi)):
+            w = mi.rcWork
+            return w.l, w.t, w.r, w.b
+    except Exception:
+        pass
+    return work_area(win)
 
 
 def virtual_screen(root):
@@ -1197,14 +1307,19 @@ class Tip:
         widget.bind("<Leave>", self.hide, add="+")
 
     def show(self, _e=None):
+        Tip.popup(self.w, self.text, self.w.winfo_rootx(), self.w.winfo_rooty() + self.w.winfo_height() + 4)
+
+    @staticmethod
+    def popup(anchor, text, x, y):
+        """Show a tooltip at screen position x, y (also used for areas drawn on a canvas)."""
         Tip.close()
-        tw = tk.Toplevel(self.w)
+        tw = tk.Toplevel(anchor)
         tw.overrideredirect(True)
         tw.attributes("-topmost", True)
-        tk.Label(tw, text=self.text, bg=C["panel"], fg=C["fg"], font=f(9),
+        tk.Label(tw, text=text, bg=C["panel"], fg=C["fg"], font=f(9),
                  justify="left", padx=8, pady=5, highlightthickness=1,
                  highlightbackground=C["border"]).pack()
-        tw.geometry(f"+{self.w.winfo_rootx()}+{self.w.winfo_rooty() + self.w.winfo_height() + 4}")
+        tw.geometry(f"+{x}+{y}")
         round_window(tw, small=True)
         Tip.current = tw
 
@@ -2303,6 +2418,10 @@ class App:
         C.update(THEMES[self.store.settings["theme"]])
         UI["scale"] = float(self.store.settings.get("size") or 1.0)
         self.s = root.winfo_fpixels("1i") / 96.0 * UI["scale"]
+        self.live_fonts = LiveFonts(root)
+        self._scale_target = UI["scale"]   # where a resize is gliding to
+        self._scale_job = None
+        self._nudged = False               # moved back on screen during a resize, not saved yet
         self.undo_state = None
         self._cur_alpha = None
         self.toasts = {}
@@ -2313,11 +2432,12 @@ class App:
         self.tray = None
         self.hotkey_ok = True
         self._drag = None
-        self._fwd = None            # widget receiving clicks forwarded from the glass catcher
+        self._resize = None          # (x, y, width, scale) while the resize grip is held
+        self._fwd = None           # widget receiving clicks forwarded from the glass catcher
         self.glass = False
         self.catcher = None
         self._animating = False
-        self._lights = None
+        self._light_cache = {}             # traffic-light images by pixel size
         today = date.today()
         self.vy, self.vm = today.year, today.month
         self.last_day = today
@@ -2338,14 +2458,20 @@ class App:
         self.update_alpha()
         self.frame = tk.Frame(root, bg=C["bg"])
         self.frame.pack(fill="both", expand=True, padx=2, pady=2)
-        # Resize grip: lives on the root (not in self.frame) so it survives re-renders mid-drag.
-        self._resize = None
-        self.grip = tk.Label(root, text="◢", bg=C["bg"], fg=C["faint"], font=f(8),
-                             cursor="size_nw_se", bd=0, padx=0, pady=0)
-        self.grip.bind("<ButtonPress-1>", self._grip_press)
-        self.grip.bind("<B1-Motion>", self._grip_motion)
-        self.grip.bind("<ButtonRelease-1>", self._grip_release)
-        Tip(self.grip, "Drag to resize  ·  or Ctrl + scroll")
+        # The whole widget is drawn on ONE canvas. Resizing then just moves canvas items instead
+        # of shuffling dozens of child windows, which is what keeps it smooth.
+        self.cv = tk.Canvas(self.frame, bg=C["bg"], highlightthickness=0, bd=0)
+        self.cv.pack()
+        self.zones = []             # clickable / hoverable areas on the canvas
+        self._v = None              # what's drawn (items + fonts), for re-layout on resize
+        self._hover = None
+        self._lights_hover = False
+        self._press_zone = None
+        self._render_pending = False
+        for seq, fn in (("<Motion>", self._cv_motion), ("<Leave>", lambda e: self._set_hover(None)),
+                        ("<ButtonPress-1>", self._cv_press), ("<B1-Motion>", self._cv_drag),
+                        ("<ButtonRelease-1>", self._cv_release)):
+            self.cv.bind(seq, fn)
         root.bind("<Control-MouseWheel>", self._wheel_resize)
         self._blink_on = False
         self._alerting = False
@@ -2353,7 +2479,6 @@ class App:
             self.tray = self.start_tray()
             threading.Thread(target=hotkey_loop, args=(self.events,), daemon=True).start()
         self.menu = self._build_menu()
-        self.make_drag(self.frame)   # empty areas drag the widget too
         self.render()
         self._place()
         round_window(root)
@@ -2410,8 +2535,8 @@ class App:
         """Keep the catcher exactly under the widget. Only touches it when something changed,
         so it can't feed back into the widget's own <Configure> events."""
         c = self.catcher
-        if c is None:
-            return
+        if c is None or self._resize is not None or self._scale_job is not None:
+            return          # resizing: one window to resize per frame is enough; synced after
         try:
             if not self.glass or self.root.state() == "withdrawn":
                 if c.state() != "withdrawn":
@@ -2452,9 +2577,6 @@ class App:
                 if r is not None:
                     return r
             return w
-        g = getattr(self, "grip", None)
-        if g is not None and hit(g) is not None:
-            return g
         return hit(self.frame)
 
     def _forward(self, e):
@@ -2528,41 +2650,17 @@ class App:
                                       root.attributes("-alpha", max(0.0, a0 * (1 - p)))),
                 done=done, ease=ease_in_cubic)
 
+    def light_px(self):
+        return max(10, int(12 * self.s))
+
     def get_lights(self):
-        px = max(10, int(12 * self.s))
-        if self._lights is None or self._lights[0] != px:
+        px = self.light_px()
+        if px not in self._light_cache:
             try:
-                self._lights = (px, light_images(px))
+                self._light_cache[px] = light_images(px)
             except Exception:
-                self._lights = (px, None)
-        return self._lights[1]
-
-    def _traffic_lights(self, parent):
-        """Red = hide, yellow = collapse, green = big calendar. Symbols appear on hover, like a Mac."""
-        box = tk.Frame(parent, bg=C["bg"])
-        imgs = self.get_lights()
-        acts = [(self.hide_widget, "Hide to tray" if self.tray else "Collapse"),
-                (self.toggle_collapse, "Collapse"), (self.open_big, "Big calendar")]
-        dots = []
-        for i, (cmd, tip) in enumerate(acts):
-            if imgs:
-                d = tk.Label(box, image=imgs[i][0], bg=C["bg"], bd=0, cursor="hand2")
-            else:   # no Pillow: plain coloured circles
-                d = tk.Canvas(box, width=12, height=12, bg=C["bg"], highlightthickness=0, cursor="hand2")
-                d.create_oval(1, 1, 11, 11, fill=("#ff5f57", "#febc2e", "#28c840")[i], width=0)
-            d.pack(side="left", padx=(0 if i == 0 else 4, 0))
-            d.bind("<Button-1>", lambda e, c=cmd: c())
-            Tip(d, tip)
-            dots.append(d)
-
-        def hover(on):
-            if imgs:
-                for i, d in enumerate(dots):
-                    d.config(image=imgs[i][1 if on else 0])
-        for w in [box] + dots:
-            w.bind("<Enter>", lambda e: hover(True), add="+")
-            w.bind("<Leave>", lambda e: hover(False), add="+")
-        return box
+                self._light_cache[px] = None
+        return self._light_cache[px]
 
     # ---- setup
     def _style(self):
@@ -2689,7 +2787,7 @@ class App:
                     hovered = rx <= x < rx + self.root.winfo_width() and ry <= y < ry + self.root.winfo_height()
                 except tk.TclError:
                     pass
-            if waiting or hovered or self._drag is not None:
+            if waiting or hovered or self._drag is not None or self._resize is not None:
                 a = 1.0
         if a != self._cur_alpha:
             self.root.attributes("-alpha", a)
@@ -2818,35 +2916,7 @@ class App:
                 pass
         self.root.after(250, self.poll_events)
 
-    # ---- drag / click
-    def make_drag(self, w, on_click=None):
-        def press(e):
-            self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(), False)
-
-        def motion(e):
-            if not self._drag:
-                return
-            sx, sy, wx, wy, moved = self._drag
-            dx, dy = e.x_root - sx, e.y_root - sy
-            if moved or abs(dx) + abs(dy) > 4:
-                self._drag = (sx, sy, wx, wy, True)
-                self.root.geometry(f"+{wx + dx}+{wy + dy}")
-
-        def release(_e):
-            d, self._drag = self._drag, None
-            if not d:
-                return
-            if d[4]:
-                self.store.settings["x"] = self.root.winfo_x()
-                self.store.settings["y"] = self.root.winfo_y()
-                self.store.save_settings()
-            elif on_click:
-                on_click()
-
-        w.bind("<ButtonPress-1>", press)
-        w.bind("<B1-Motion>", motion)
-        w.bind("<ButtonRelease-1>", release)
-
+    # ---- right-click menu
     def bind_menu(self, w):
         w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
         for c in w.winfo_children():
@@ -2863,17 +2933,23 @@ class App:
                 self.big = None
 
     def render(self):
+        """Redraw the widget. Cheap and flicker-free: it's canvas items, not windows."""
+        if self._resize is not None:      # never pull the grip out from under the mouse
+            self._render_pending = True
+            return
+        self._render_pending = False
         Tip.close()
-        for w in self.frame.winfo_children():
-            w.destroy()
-        if self.store.settings["collapsed"]:
-            self._render_collapsed()
-            self.grip.place_forget()
-        else:
-            self._render_full()
-            self.grip.configure(bg=C["bg"], fg=C["faint"], font=f(8))
-            self.grip.place(relx=1.0, rely=1.0, anchor="se", x=-3, y=-2)
-            self.grip.lift()
+        cv = self.cv
+        cv.delete("all")
+        cv.configure(bg=C["bg"], cursor="")
+        self.zones, self._hover, self._lights_hover = [], None, False
+        self.live_fonts.begin()
+        UI["live"] = self.live_fonts      # text uses fonts that resize in place
+        try:
+            self._v = self._build_collapsed() if self.store.settings["collapsed"] else self._build_full()
+        finally:
+            UI["live"] = None
+        self.relayout()
         self.bind_menu(self.frame)
         self.last_render_min = datetime.now().minute
         self.update_tray_title()
@@ -2904,120 +2980,328 @@ class App:
             return left, C["ok"]
         return f"{eff.day} {eff:%b}", C["dim"]
 
-    def _render_collapsed(self):
+    # ---- the floating widget, drawn on one canvas
+    def _text(self, text, font, fill, anchor="center"):
+        """A text item (tagged by its font, so a resize restyles it in one go), plus what's
+        needed to measure it again."""
+        lf = self.live_fonts
+        key = lf.key_of(font)
+        item = self.cv.create_text(0, 0, text=text, font=lf.desc(key), fill=fill, anchor=anchor,
+                                   tags=(lf.tags[key],))
+        return dict(item=item, font=font, label=text)
+
+    def _button(self, text, click, font, fill, tip=None):
+        rect = self.cv.create_rectangle(0, 0, 0, 0, outline="", fill=C["bg"])   # hover background
+        b = self._text(text, font, fill)
+        b.update(rect=rect, click=click, tip=tip)
+        return b
+
+    def _tw(self, t):
+        return self.live_fonts.measure(t["font"], t["label"])
+
+    def _lh(self, t):
+        return self.live_fonts.linespace(t["font"])
+
+    def _build_collapsed(self):
         today = date.today()
-        row = tk.Frame(self.frame, bg=C["bg"], padx=10, pady=6, cursor="fleur")
-        row.pack()
         up = self._upcoming()
-        icon = tk.Label(row, text="\u25f7", bg=C["bg"], fg=C["accent"], font=f(11))
-        txt = tk.Label(row, text=f"{today:%a} {today.day} {today:%b}", bg=C["bg"],
-                       fg=C["fg"], font=fh(10))
+        parts = [self._text("◷", f(11), C["accent"], "w"),
+                 self._text(f"{today:%a} {today.day} {today:%b}", fh(10), C["fg"], "w")]
         if up:
             label, color = self.countdown(up[0], compact=True)
-            more = f"  \u00b7  {up[0]['title'][:22]} "
-            sub2 = tk.Label(row, text=label, bg=C["bg"], fg=color, font=f(9, "bold"))
+            parts.append(self._text(f"  ·  {up[0]['title'][:22]} ", f(9), C["dim"], "w"))
+            parts.append(self._text(label, f(9, "bold"), color, "w"))
         else:
-            more, sub2 = "  \u00b7  nothing due", None
-        sub = tk.Label(row, text=more, bg=C["bg"], fg=C["dim"], font=f(9))
-        widgets = [icon, txt, sub] + ([sub2] if sub2 else [])
-        for w in widgets:
-            w.pack(side="left")
-        for w in [row] + widgets:
-            self.make_drag(w, on_click=self.toggle_collapse)
+            parts.append(self._text("  ·  nothing due", f(9), C["dim"], "w"))
+        return {"kind": "collapsed", "parts": parts}
 
-    def _render_full(self):
-        today = date.today()
-        now = datetime.now()
-        hdr = tk.Frame(self.frame, bg=C["bg"], padx=10, pady=8)
-        hdr.pack(fill="x")
-        hb = dict(bg=C["bg"], font=f(11), padx=5, pady=0)
-        self._traffic_lights(hdr).pack(side="left", padx=(0, 10))
-        mkbtn(hdr, "\u2039", lambda: self.shift(-1), **hb).pack(side="left")
-        title = tk.Label(hdr, text=heading(f"{calendar.month_abbr[self.vm]} {self.vy}", spaced=False),
-                         bg=C["bg"], fg=C["fg"], font=fh(11), cursor="fleur")
-        title.pack(side="left")
-        mkbtn(hdr, "\u203a", lambda: self.shift(1), **hb).pack(side="left")
-        mkbtn(hdr, "\u22ef", lambda: self.menu.tk_popup(self.root.winfo_pointerx(),
-                                                        self.root.winfo_pointery()), **hb).pack(side="right")
-        add = mkbtn(hdr, "+", self.quick_add, bg=C["bg"], fg=C["accent"], font=f(13, "bold"), padx=5, pady=0)
-        add.pack(side="right")
-        Tip(add, f"Quick add ({HOTKEY_LABEL})")
-        self.make_drag(hdr)
-        self.make_drag(title, on_click=self.goto_today)
-
-        tk.Frame(self.frame, bg=C["border"], height=1).pack(fill="x", padx=10)
-        if C.get("double_rule"):  # a little printed-almanac flourish
-            tk.Frame(self.frame, bg=C["border"], height=1).pack(fill="x", padx=10, pady=(2, 0))
-
-        grid = tk.Frame(self.frame, bg=C["bg"], padx=8, pady=4)
-        grid.pack()
+    def _build_full(self):
+        cv, today, now = self.cv, date.today(), datetime.now()
+        v = {"kind": "full"}
+        # traffic lights: red = hide, yellow = collapse, green = big calendar (symbols on hover)
+        imgs = self.get_lights()
+        acts = [(self.hide_widget, "Hide to tray" if self.tray else "Collapse"),
+                (self.toggle_collapse, "Collapse"), (self.open_big, "Big calendar")]
+        v["lights"] = [dict(item=cv.create_image(0, 0, image=imgs[i][0]) if imgs else
+                            cv.create_oval(0, 0, 0, 0, outline="", fill=("#ff5f57", "#febc2e", "#28c840")[i]),
+                            click=cmd, tip=tip) for i, (cmd, tip) in enumerate(acts)]
+        bf = f(11)
+        v["prev"] = self._button("‹", lambda: self.shift(-1), bf, C["fg"])
+        v["title"] = self._text(heading(f"{calendar.month_abbr[self.vm]} {self.vy}", spaced=False),
+                                fh(11), C["fg"], "w")
+        v["next"] = self._button("›", lambda: self.shift(1), bf, C["fg"])
+        v["add"] = self._button("+", self.quick_add, f(13, "bold"), C["accent"], f"Quick add ({HOTKEY_LABEL})")
+        v["more"] = self._button("⋯", lambda: self.menu.tk_popup(self.root.winfo_pointerx(),
+                                                                     self.root.winfo_pointery()), bf, C["fg"])
+        v["rules"] = [cv.create_line(0, 0, 0, 0, fill=C["border"])          # double = almanac flourish
+                      for _ in range(2 if C.get("double_rule") else 1)]
+        # month grid
         ws = self.store.settings["week_start"]
         names = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-        for i in range(7):
-            n = names[(ws + i) % 7]
-            tk.Label(grid, text=n.upper() if C["upper"] else n, bg=C["bg"], fg=C["faint"],
-                     font=f(8), width=4).grid(row=0, column=i, pady=(0, 2))
-
+        wf = f(8)
+        v["wd"] = [self._text(n.upper() if C["upper"] else n, wf, C["faint"])
+                   for n in (names[(ws + i) % 7] for i in range(7))]
+        cf, cbf = f(9), f(9, "bold")
+        v["cell_font"] = cf
         pending = self.store.pending()
-        cal = calendar.Calendar(ws)
-        for wi, week in enumerate(cal.monthdayscalendar(self.vy, self.vm), start=1):
+        weeks = calendar.Calendar(ws).monthdayscalendar(self.vy, self.vm)
+        v["weeks"], v["cells"] = len(weeks), []
+        # one highlight that moves to whichever plain day is under the mouse
+        v["hover_cell"] = cv.create_rectangle(0, 0, 0, 0, outline="", fill=C["panel"], state="hidden")
+        for wi, week in enumerate(weeks):
             for di, day in enumerate(week):
                 if not day:
-                    tk.Label(grid, text="", bg=C["bg"], width=4).grid(row=wi, column=di)
                     continue
                 d = date(self.vy, self.vm, day)
                 evs = [r for r in pending if occurs_on(r, d)]
-                bg, fg, font = C["bg"], C["fg"], f(9)
+                bg, fg, font = C["bg"], C["fg"], cf
                 if d < today:
                     fg = C["faint"]
                 if evs:
-                    bg, fg, font = C["event"], C["fg"], f(9, "bold")
+                    bg, fg, font = C["event"], C["fg"], cbf
                 if d == today:
-                    bg, fg, font = C["accent"], C["accent_fg"], f(9, "bold")
-                cell = tk.Label(grid, text=str(day), bg=bg, fg=fg, font=font, width=4,
-                                pady=3, cursor="hand2")
-                cell.grid(row=wi, column=di, padx=1, pady=1)
-                cell.bind("<Button-1>", lambda e, dd=d: self.open_day(dd))
-                if bg == C["bg"]:
-                    cell.bind("<Enter>", lambda e, c=cell: c.config(bg=C["panel"]))
-                    cell.bind("<Leave>", lambda e, c=cell: c.config(bg=C["bg"]))
-                if evs:
-                    Tip(cell, "\n".join(f"{fmt_time(r.get('time')) or 'All day'}  \u00b7  {r['title']}"
-                                        for r in evs))
-
-        tk.Frame(self.frame, bg=C["border"], height=1).pack(fill="x", padx=10, pady=(6, 6))
-        box = tk.Frame(self.frame, bg=C["bg"], padx=12)
-        box.pack(fill="x", pady=(0, 10))
-        tk.Label(box, text=heading("Upcoming"), bg=C["bg"], fg=C["faint"],
-                 font=fh(8)).pack(anchor="w", pady=(0, 3))
+                    bg, fg, font = C["accent"], C["accent_fg"], cbf
+                rect = None if bg == C["bg"] else cv.create_rectangle(0, 0, 0, 0, outline="", fill=bg)
+                cell = self._text(str(day), font, fg)
+                cell.update(rect=rect, row=wi, col=di, date=d, bg=bg, tip="\n".join(
+                    f"{fmt_time(r.get('time')) or 'All day'}  ·  {r['title']}" for r in evs) or None)
+                v["cells"].append(cell)
+        # upcoming list
+        v["rule2"] = cv.create_line(0, 0, 0, 0, fill=C["border"])
+        v["head"] = self._text(heading("Upcoming"), fh(8), C["faint"], "w")
         up = self._upcoming()[:6]
-        if not up:
-            tk.Label(box, text=f"Nothing yet. Click + or press {HOTKEY_LABEL}.",
-                     bg=C["bg"], fg=C["dim"], font=f(9)).pack(anchor="w")
+        v["empty"] = None if up else self._text(f"Nothing yet. Click + or press {HOTKEY_LABEL}.",
+                                                f(9), C["dim"], "w")
+        v["rows"] = []
         for r in up:
             label, color = self.countdown(r, now, compact=True)
-            row = tk.Frame(box, bg=C["bg"], cursor="hand2")
-            row.pack(fill="x", pady=1)
             imp = r.get("important")
             limit = 18 if r.get("checklist") else 22
             title_txt = ("! " if imp else "") + r["title"]
             if len(title_txt) > limit:
-                title_txt = title_txt[:limit - 1] + "\u2026"
+                title_txt = title_txt[:limit - 1] + "…"
             if r.get("repeat", "none") != "none":
-                title_txt += "  \u21bb"
-            ws_ = [tk.Label(row, text="\u25cf", bg=C["bg"], fg=cat_color(r), font=f(8)),
-                   tk.Label(row, text=title_txt, bg=C["bg"], fg=C["danger"] if imp else C["fg"],
-                            font=f(9, "bold") if imp else f(9), anchor="w"),
-                   tk.Label(row, text=label, bg=C["bg"], fg=color, font=f(8, "bold"))]
-            if r.get("checklist"):
-                ws_.append(tk.Label(row, text=progress(r), bg=C["bg"], fg=C["dim"], font=f(8)))
-            ws_[0].pack(side="left", padx=(0, 6))
-            ws_[2].pack(side="right")
-            if len(ws_) > 3:
-                ws_[3].pack(side="right", padx=(0, 6))
-            ws_[1].pack(side="left", fill="x", expand=True)
-            for w in [row] + ws_:
-                w.bind("<Button-1>", lambda e, rr=r: self.edit(rr))
+                title_txt += "  ↻"
+            v["rows"].append(dict(
+                r=r, dot=self._text("●", f(8), cat_color(r)),
+                title=self._text(title_txt, f(9, "bold") if imp else f(9), C["danger"] if imp else C["fg"], "w"),
+                cd=self._text(label, f(8, "bold"), color, "e"),
+                prog=self._text(progress(r), f(8), C["dim"], "e") if r.get("checklist") else None))
+        v["grip"] = self._text("◢", f(8), C["faint"], "se")
+        return v
+
+    def relayout(self):
+        """Position everything for the current size. Runs on every frame of a resize, so it only
+        moves the existing items; nothing is created or destroyed."""
+        v = self._v
+        if v is None:
+            return
+        key = self._hover["key"] if self._hover else None
+        self.zones = []
+        w, h = (self._layout_full if v["kind"] == "full" else self._layout_collapsed)(v)
+        self.cv.configure(width=round(w), height=round(h))
+        if key is not None:
+            self._hover = self.zone(key)
+            if self._hover is not None and self._hover["hl"] == "cell":
+                self._show_cell_hover(self._hover)
+
+    def _show_cell_hover(self, z):
+        k, (x0, y0, x1, y1) = self.s, z["bbox"]
+        self.cv.coords(self._v["hover_cell"], x0 + k, y0 + k, x1 - k, y1 - k)
+        self.cv.itemconfigure(self._v["hover_cell"], state="normal")
+
+    def _zone(self, key, bbox, click=None, tip=None, cursor="hand2", hl=None, group=None, item=None):
+        """A clickable / hoverable area. hl = (item, hover fill, normal fill)."""
+        self.zones.append(dict(key=key, bbox=bbox, click=click, tip=tip, cursor=cursor,
+                               hl=hl, group=group, item=item))
+
+    def zone(self, key):
+        return next((z for z in self.zones if z["key"] == key), None)
+
+    def zone_at(self, x, y):
+        for z in reversed(self.zones):        # the resize grip (added last) wins
+            x0, y0, x1, y1 = z["bbox"]
+            if x0 <= x < x1 and y0 <= y < y1:
+                return z
+        return None
+
+    def _layout_collapsed(self, v):
+        k, cv = self.s, self.cv
+        h = max(self._lh(t) for t in v["parts"])
+        x, cy = 10 * k, 6 * k + h / 2
+        for t in v["parts"]:
+            cv.coords(t["item"], x, cy)
+            x += self._tw(t)
+        w, h = x + 10 * k, h + 12 * k
+        self._zone("collapsed", (0, 0, w, h), self.toggle_collapse, cursor="fleur")
+        return w, h
+
+    def _layout_full(self, v):
+        cv, k, tw, lh, lf = self.cv, self.s, self._tw, self._lh, self.live_fonts
+        cf = v["cell_font"]
+        cw = lf.measure(cf, "0") * 4 + 6 * k             # day-cell size
+        ch = lf.linespace(cf) + 8 * k
+        px = self.light_px()
+
+        def bw(b):
+            return tw(b) + 10 * k
+        # the widest of header / month grid / upcoming rows sets the width
+        head_w = (20 * k + 3 * px + 8 * k + 10 * k + bw(v["prev"]) + tw(v["title"]) + bw(v["next"])
+                  + 12 * k + bw(v["add"]) + bw(v["more"]))
+        rows_w = [tw(rw["dot"]) + 6 * k + tw(rw["title"]) + 12 * k + tw(rw["cd"])
+                  + (tw(rw["prog"]) + 6 * k if rw["prog"] else 0) for rw in v["rows"]]
+        if v["empty"]:
+            rows_w.append(tw(v["empty"]))
+        W = max(head_w, 7 * cw + 16 * k, max(rows_w, default=0) + 24 * k)
+
+        # header
+        hh = max(lh(v["title"]), lh(v["prev"]), lh(v["add"]), px)
+        y, x = 8 * k, 10 * k
+        cy = y + hh / 2
+        imgs = self.get_lights()
+        new_px, v["lights_px"] = v.get("lights_px") != px, px
+        for i, L in enumerate(v["lights"]):
+            if imgs:
+                if new_px:          # bigger / smaller dots only when their pixel size changes
+                    cv.itemconfigure(L["item"], image=imgs[i][1 if self._lights_hover else 0])
+                cv.coords(L["item"], x + px / 2, cy)
+            else:
+                cv.coords(L["item"], x, cy - px / 2, x + px, cy + px / 2)
+            self._zone(("light", i), (x - 2 * k, cy - px / 2 - 2 * k, x + px + 2 * k, cy + px / 2 + 2 * k),
+                       L["click"], L["tip"], group="lights")
+            x += px + 4 * k
+        x += 6 * k
+
+        def place(b, x0, key):
+            w = bw(b)
+            cv.coords(b["rect"], x0, y, x0 + w, y + hh)
+            cv.coords(b["item"], x0 + w / 2, cy)
+            self._zone(key, (x0, y, x0 + w, y + hh), b["click"], b["tip"],
+                       hl=(b["rect"], shade(C["bg"]), C["bg"]))
+            return x0 + w
+        x = place(v["prev"], x, "prev")
+        cv.coords(v["title"]["item"], x, cy)
+        self._zone("title", (x, y, x + tw(v["title"]), y + hh), self.goto_today, cursor="fleur")
+        place(v["next"], x + tw(v["title"]), "next")
+        place(v["more"], W - 10 * k - bw(v["more"]), "more")
+        place(v["add"], W - 10 * k - bw(v["more"]) - bw(v["add"]), "add")
+        y += hh + 8 * k
+        for i, line in enumerate(v["rules"]):
+            cv.coords(line, 10 * k, y + 3 * k * i, W - 10 * k, y + 3 * k * i)
+        y += 3 * k * (len(v["rules"]) - 1) + 1 + 4 * k
+
+        # month grid
+        gx = (W - 7 * cw) / 2
+        wh = lh(v["wd"][0])
+        for i, t in enumerate(v["wd"]):
+            cv.coords(t["item"], gx + cw * (i + 0.5), y + wh / 2)
+        y += wh + 2 * k
+        for c in v["cells"]:
+            x0, y0 = gx + cw * c["col"], y + ch * c["row"]
+            if c["rect"] is not None:
+                cv.coords(c["rect"], x0 + k, y0 + k, x0 + cw - k, y0 + ch - k)
+            cv.coords(c["item"], x0 + cw / 2, y0 + ch / 2)
+            self._zone(("day", c["date"].day), (x0, y0, x0 + cw, y0 + ch),
+                       lambda d=c["date"]: self.open_day(d), c["tip"], item=c["item"],
+                       hl=None if c["rect"] is not None else "cell")
+        y += ch * v["weeks"] + 4 * k + 6 * k
+        cv.coords(v["rule2"], 10 * k, y, W - 10 * k, y)
+        y += 1 + 6 * k
+
+        # upcoming
+        hx = 12 * k
+        cv.coords(v["head"]["item"], hx, y + lh(v["head"]) / 2)
+        y += lh(v["head"]) + 3 * k
+        if v["empty"]:
+            cv.coords(v["empty"]["item"], hx, y + lh(v["empty"]) / 2)
+            y += lh(v["empty"])
+        for rw in v["rows"]:
+            rh = max(lh(rw["title"]), lh(rw["cd"])) + 2 * k
+            ry = y + rh / 2
+            dw = tw(rw["dot"])
+            cv.coords(rw["dot"]["item"], hx + dw / 2, ry)
+            cv.coords(rw["title"]["item"], hx + dw + 6 * k, ry)
+            cv.coords(rw["cd"]["item"], W - hx, ry)
+            if rw["prog"]:
+                cv.coords(rw["prog"]["item"], W - hx - tw(rw["cd"]) - 6 * k, ry)
+            self._zone(("row", rw["r"]["id"]), (hx, y, W - hx, y + rh), lambda r=rw["r"]: self.edit(r))
+            y += rh
+        H = y + 10 * k
+        cv.coords(v["grip"]["item"], W - 2 * k, H - k)
+        self._zone("grip", (W - 14 * k, H - 12 * k, W, H), tip="Drag to resize  ·  or Ctrl + scroll",
+                   cursor="size_nw_se")
+        return W, H
+
+    # ---- mouse on the canvas: hover, click, drag the widget, resize grip
+    def _cv_motion(self, e):
+        self._set_hover(self.zone_at(e.x, e.y))
+
+    def _set_hover(self, z):
+        old = self._hover
+        if (old and old["key"]) == (z and z["key"]):
+            return
+        cv = self.cv
+        Tip.close()
+        try:
+            if old is not None and old["hl"] == "cell":
+                cv.itemconfigure(self._v["hover_cell"], state="hidden")
+            elif old is not None and old["hl"]:
+                cv.itemconfigure(old["hl"][0], fill=old["hl"][2])
+            lights = z is not None and z["group"] == "lights"
+            if lights != self._lights_hover:          # all three show their symbols together
+                self._lights_hover = lights
+                imgs = self.get_lights()
+                if imgs and self._v and self._v.get("lights"):
+                    for i, L in enumerate(self._v["lights"]):
+                        cv.itemconfigure(L["item"], image=imgs[i][1 if lights else 0])
+            self._hover = z
+            cv.configure(cursor=z["cursor"] if z else "")
+            if z is None:
+                return
+            if z["hl"] == "cell":
+                self._show_cell_hover(z)
+            elif z["hl"]:
+                cv.itemconfigure(z["hl"][0], fill=z["hl"][1])
+            if z["tip"] and self._resize is None and self._drag is None:
+                x0, y0, x1, y1 = z["bbox"]
+                Tip.popup(cv, z["tip"], round(cv.winfo_rootx() + x0), round(cv.winfo_rooty() + y1 + 4))
+        except tk.TclError:
+            pass
+
+    def _cv_press(self, e):
+        z = self.zone_at(e.x, e.y)
+        Tip.close()
+        if z is not None and z["key"] == "grip":
+            return self._grip_press(e)
+        self._press_zone = z
+        self._drag = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(), False)
+
+    def _cv_drag(self, e):
+        if self._resize is not None:
+            return self._grip_motion(e)
+        if not self._drag:
+            return
+        sx, sy, wx, wy, moved = self._drag
+        dx, dy = e.x_root - sx, e.y_root - sy
+        if moved or abs(dx) + abs(dy) > 4:       # a real drag moves the widget instead of clicking
+            self._drag = (sx, sy, wx, wy, True)
+            self.root.geometry(f"+{wx + dx}+{wy + dy}")
+
+    def _cv_release(self, e):
+        if self._resize is not None:
+            return self._grip_release(e)
+        d, self._drag = self._drag, None
+        z, self._press_zone = self._press_zone, None
+        if not d:
+            return
+        sx, sy, wx, wy, moved = d
+        if moved:      # where the pointer let go (Tk may not have applied the last move yet)
+            x, y = wx + e.x_root - sx, wy + e.y_root - sy
+            self.root.geometry(f"+{x}+{y}")
+            self.store.settings["x"], self.store.settings["y"] = x, y
+            self.store.save_settings()
+        elif z is not None and z["click"]:
+            z["click"]()
 
     # ---- actions
     def shift(self, n):
@@ -3169,14 +3453,13 @@ class App:
         self.update_alpha()
 
     def set_size(self, v):
-        self._set("size", v)
-        UI["scale"] = v
-        self.s = self.root.winfo_fpixels("1i") / 96.0 * v
-        self.rebuild_ui()
-        self.keep_on_screen()
+        """Size menu presets glide to the new size too."""
+        self.resize_to(v)
 
-    # ---- free resizing (corner grip / Ctrl+scroll)
+    # ---- smooth resizing (corner grip / Ctrl+scroll / Size menu)
     SIZE_MIN, SIZE_MAX = 0.7, 2.2
+    GLIDE = 0.4          # share of the remaining gap closed each frame (~95 % in 0.1 s)
+    FRAME_MS = 15
 
     def _grip_press(self, e):
         Tip.close()
@@ -3186,49 +3469,99 @@ class App:
         if not self._resize:
             return
         sx, sy, w0, s0 = self._resize
-        d = ((e.x_root - sx) + (e.y_root - sy)) / 2      # diagonal pull
-        self.resize_to(s0 * (w0 + d) / w0, live=True)
+        d = ((e.x_root - sx) + (e.y_root - sy)) / 2      # diagonal pull, in pixels
+        self.resize_to(s0 * (w0 + d) / w0)
 
     def _grip_release(self, _e=None):
         if self._resize is None:
             return
         self._resize = None
-        self.resize_to(UI["scale"])
+        self.resize_to(self._scale_target)              # finish gliding, then save
 
     def _wheel_resize(self, e):
-        self.resize_to(UI["scale"] + (0.05 if e.delta > 0 else -0.05))
+        # one wheel notch = 5 %; precision touchpads send smaller deltas for finer steps
+        self.resize_to(self._scale_target + 0.05 * e.delta / 120)
         return "break"
 
-    def resize_to(self, v, live=False):
-        """Scale the whole widget smoothly. `live` = still dragging, so don't save yet."""
-        v = round(max(self.SIZE_MIN, min(self.SIZE_MAX, round(v / 0.05) * 0.05)), 2)
-        if v != round(UI["scale"], 2):
-            UI["scale"] = v
-            self.s = self.root.winfo_fpixels("1i") / 96.0 * v
-            self.render()
-        if not live:
-            self.store.settings["size"] = v
+    def resize_to(self, v):
+        """Glide to size v. While the grip is held this runs on every mouse move: the target
+        follows the pointer continuously and the widget eases after it frame by frame."""
+        self._scale_target = max(self.SIZE_MIN, min(self.SIZE_MAX, float(v)))
+        if self._scale_job is None:
+            self._scale_step()
+
+    def _scale_step(self):
+        self._scale_job = None
+        cur, tgt = UI["scale"], self._scale_target
+        if ANIM["on"] and abs(tgt - cur) > 0.002:
+            cur += (tgt - cur) * self.GLIDE
+            try:
+                self._scale_job = self.root.after(self.FRAME_MS, self._scale_step)
+            except tk.TclError:
+                return
+        else:
+            cur = tgt
+        self.apply_scale(cur)
+        if self._scale_job is None and self._resize is None:
+            self._resize_done()
+
+    def apply_scale(self, v):
+        """Show the widget at size v right now: restyle the text one font at a time, then move
+        the canvas items into place. Nothing is rebuilt, so nothing flickers."""
+        UI["scale"] = v
+        self.s = self.root.winfo_fpixels("1i") / 96.0 * v
+        lf = self.live_fonts
+        for key in lf.rescale():
+            self.cv.itemconfigure(lf.tags[key], font=lf.desc(key))
+        self.relayout()
+        self.keep_on_screen(save=False)
+
+    def _resize_done(self):
+        """The glide has settled: remember the size and bring the other windows along."""
+        v = round(UI["scale"], 3)
+        self._scale_target = v
+        self.apply_scale(v)
+        st = self.store.settings
+        if st.get("size") != v:
+            st["size"] = v
             self.store.save_settings()
-            self._style()
             try:
                 self.v_size.set(v)
             except (AttributeError, tk.TclError):
                 pass
-            self.keep_on_screen()
+            self._style()                               # tables in the big calendar
+            if self.big is not None and not getattr(self.big, "_closing", False):
+                try:
+                    self.big.refresh()
+                except tk.TclError:
+                    self.big = None
+        if self._render_pending:          # something changed while the grip was held
+            self.render()
+        self.keep_on_screen()
+        self.sync_catcher(restack=True)
 
-    def keep_on_screen(self):
-        """After growing, nudge the widget back inside the screen's work area."""
+    def keep_on_screen(self, save=True):
+        """Keep the widget inside the work area of the monitor it's on, e.g. while it grows
+        near a screen edge. `save` stores a position that had to move."""
+        root = self.root
         try:
-            self.root.update_idletasks()
-            l, t, r, b = work_area(self.root)
-            w, h = self.root.winfo_width(), self.root.winfo_height()
-            x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+            if root.state() == "withdrawn":
+                return
+            root.update_idletasks()
+            l, t, r, b = monitor_work_area(root)
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+            x0, y0 = root.winfo_x(), root.winfo_y()
         except tk.TclError:
             return
         x = max(l, min(x0, r - w))
         y = max(t, min(y0, b - h))
-        if (x, y) != (x0, y0):
-            self.root.geometry(f"+{x}+{y}")
+        moved = (x, y) != (x0, y0)
+        if moved:
+            root.geometry(f"+{x}+{y}")
+        if not save:
+            self._nudged = self._nudged or moved
+        elif moved or self._nudged:
+            self._nudged = False
             self.store.settings["x"], self.store.settings["y"] = x, y
             self.store.save_settings()
 
