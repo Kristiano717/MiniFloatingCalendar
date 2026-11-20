@@ -50,7 +50,7 @@ LOCK_PORT = 47613
 NO_WINDOW = 0x08000000
 HOTKEY_LABEL = "Ctrl+Alt+R"
 NTFY_SERVER = "https://ntfy.sh"
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 NAG_SECONDS = 300   # ignored pop-ups shake and jump to the front again this often
 
 # ---------------------------------------------------------------- themes
